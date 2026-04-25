@@ -1,5 +1,5 @@
 use crate::app::{App, FlatProcessRow, FlatSharedRow, FlatTmpfsRow, Hotkey, RowFold};
-use crate::model::{Bytes, MeminfoEntry, ObjectUsage, Pid, Snapshot, TmpfsMount};
+use crate::model::{Bytes, Meminfo, MeminfoEntry, ObjectUsage, Pid, Snapshot, TmpfsMount};
 use crate::search::SearchRole;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -190,7 +190,6 @@ fn render_loading(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_overview(frame: &mut Frame<'_>, _app: &App, snapshot: &Snapshot, area: Rect) {
-    let capacity = snapshot.meminfo.get("MemTotal");
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
@@ -204,7 +203,7 @@ fn render_overview(frame: &mut Frame<'_>, _app: &App, snapshot: &Snapshot, area:
         .meminfo
         .entries
         .iter()
-        .map(|entry| row_meminfo(entry, capacity))
+        .map(|entry| row_meminfo(entry, &snapshot.meminfo))
         .collect::<Vec<_>>();
     frame.render_widget(
         Table::new(
@@ -222,59 +221,37 @@ fn render_overview(frame: &mut Frame<'_>, _app: &App, snapshot: &Snapshot, area:
     );
 
     let overview_rows = vec![
-        summary_row(
-            "Σ process PSS",
-            snapshot.overview.process_pss_total,
-            capacity,
-        ),
-        summary_row(
-            "Σ process USS",
-            snapshot.overview.process_uss_total,
-            capacity,
-        ),
-        summary_row(
-            "Σ process RSS",
-            snapshot.overview.process_rss_total,
-            capacity,
-        ),
+        summary_row("Σ process PSS", snapshot.overview.process_pss_total),
+        summary_row("Σ process USS", snapshot.overview.process_uss_total),
+        summary_row("Σ process RSS", snapshot.overview.process_rss_total),
         summary_row(
             "Σ process SwapPSS",
             snapshot.overview.process_swap_pss_total,
-            capacity,
         ),
         summary_row(
             "Σ process PSS anon",
             snapshot.overview.process_pss_anon_total,
-            capacity,
         ),
         summary_row(
             "Σ process PSS file",
             snapshot.overview.process_pss_file_total,
-            capacity,
         ),
         summary_row(
             "Σ process PSS shmem",
             snapshot.overview.process_pss_shmem_total,
-            capacity,
         ),
-        summary_row(
-            "Σ tmpfs allocated",
-            snapshot.overview.tmpfs_allocated_total,
-            capacity,
-        ),
-        summary_row("Σ SysV shm RSS", snapshot.overview.sysv_rss_total, capacity),
+        summary_row("Σ tmpfs allocated", snapshot.overview.tmpfs_allocated_total),
+        summary_row("Σ SysV shm RSS", snapshot.overview.sysv_rss_total),
         summary_text_row("processes", &snapshot.overview.process_count.to_string()),
         summary_text_row("SysV segments", &snapshot.sysv_segments.len().to_string()),
         summary_text_row("scan millis", &snapshot.elapsed.as_millis().to_string()),
-        summary_row(
+        summary_text_row(
             "inaccessible rollups",
-            Bytes(snapshot.overview.inaccessible_rollups as u64),
-            capacity,
+            &snapshot.overview.inaccessible_rollups.to_string(),
         ),
-        summary_row(
+        summary_text_row(
             "inaccessible maps",
-            Bytes(snapshot.overview.inaccessible_maps as u64),
-            capacity,
+            &snapshot.overview.inaccessible_maps.to_string(),
         ),
     ];
     frame.render_widget(
@@ -633,22 +610,23 @@ fn render_shared(frame: &mut Frame<'_>, app: &App, snapshot: &Snapshot, area: Re
     }
 }
 
-fn row_meminfo(entry: &MeminfoEntry, total: Bytes) -> Row<'static> {
+fn row_meminfo(entry: &MeminfoEntry, meminfo: &Meminfo) -> Row<'static> {
+    let total = meminfo.get("MemTotal");
+    let color = MeminfoTone::for_key(&entry.key).color(entry.value, meminfo);
     Row::new(vec![
         Cell::from(entry.key.clone()),
-        usage_cell(entry.value, total),
-        Cell::from(format!("{:.1}", entry.value.pct_of(total)))
-            .style(Style::default().fg(usage_color(entry.value, total))),
+        Cell::from(entry.value.human_iec()).style(Style::default().fg(color)),
+        Cell::from(format!("{:.1}", entry.value.pct_of(total))).style(Style::default().fg(color)),
     ])
-    .style(usage_style(false, entry.value, total))
+    .style(Style::default().fg(color))
 }
 
-fn summary_row(label: &str, value: Bytes, total: Bytes) -> Row<'static> {
+fn summary_row(label: &str, value: Bytes) -> Row<'static> {
     Row::new(vec![
         Cell::from(label.to_string()),
-        usage_cell(value, total),
+        Cell::from(value.human_iec()).style(Style::default().fg(FG)),
     ])
-    .style(usage_style(false, value, total))
+    .style(Style::default().fg(FG))
 }
 
 fn summary_text_row(label: &str, value: &str) -> Row<'static> {
@@ -843,6 +821,54 @@ fn usage_color(value: Bytes, total: Bytes) -> Color {
         return blend_rgb((105, 113, 121), (246, 248, 250), pct / 0.03);
     }
     blend_rgb((246, 248, 250), (232, 58, 46), (pct - 0.03) / 0.97)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MeminfoTone {
+    Neutral,
+    Reserve,
+    Pressure,
+}
+
+impl MeminfoTone {
+    #[must_use]
+    fn for_key(key: &str) -> Self {
+        match key {
+            "MemAvailable" => Self::Reserve,
+            "Dirty" | "Writeback" | "WritebackTmp" | "Unevictable" | "Mlocked" | "SUnreclaim"
+            | "KernelStack" | "PageTables" | "SecPageTables" | "NFS_Unstable" | "Bounce"
+            | "HardwareCorrupted" | "SwapCached" | "Zswap" | "Zswapped" => Self::Pressure,
+            _ => Self::Neutral,
+        }
+    }
+
+    #[must_use]
+    fn color(self, value: Bytes, meminfo: &Meminfo) -> Color {
+        match self {
+            Self::Neutral => neutral_meminfo_color(value),
+            Self::Reserve => reserve_color(value, meminfo.get("MemTotal")),
+            Self::Pressure => usage_color(value, meminfo.get("MemTotal")),
+        }
+    }
+}
+
+fn neutral_meminfo_color(value: Bytes) -> Color {
+    if value.0 == 0 { MUTED } else { FG }
+}
+
+fn reserve_color(value: Bytes, total: Bytes) -> Color {
+    if value.0 == 0 || total.0 == 0 {
+        return MUTED;
+    }
+
+    let pct = (value.as_f64() / total.as_f64()).clamp(0.0, 1.0);
+    if pct >= 0.10 {
+        return FG;
+    }
+    if pct <= 0.03 {
+        return HOT;
+    }
+    blend_rgb((232, 58, 46), (246, 248, 250), (pct - 0.03) / 0.07)
 }
 
 fn blend_rgb(start: (u8, u8, u8), end: (u8, u8, u8), t: f64) -> Color {
@@ -1072,5 +1098,46 @@ fn slice_window<T>(items: &[T], selected: usize, height: usize) -> SliceWindow<'
     SliceWindow {
         start,
         slice: &items[start..end],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn meminfo(total: Bytes) -> Meminfo {
+        Meminfo {
+            entries: Vec::new(),
+            table: BTreeMap::from([("MemTotal".to_string(), total)]),
+        }
+    }
+
+    #[test]
+    fn overview_meminfo_capacity_and_empty_like_rows_are_not_hot() {
+        let meminfo = meminfo(Bytes(100));
+
+        assert_eq!(MeminfoTone::for_key("MemTotal"), MeminfoTone::Neutral);
+        assert_eq!(MeminfoTone::for_key("MemFree"), MeminfoTone::Neutral);
+        assert_eq!(MeminfoTone::for_key("SwapFree"), MeminfoTone::Neutral);
+        assert_eq!(MeminfoTone::for_key("MemAvailable"), MeminfoTone::Reserve);
+
+        assert_eq!(MeminfoTone::Neutral.color(Bytes(100), &meminfo), FG);
+        assert_eq!(MeminfoTone::Neutral.color(Bytes(0), &meminfo), MUTED);
+        assert_eq!(MeminfoTone::Reserve.color(Bytes(40), &meminfo), FG);
+        assert_eq!(MeminfoTone::Reserve.color(Bytes(2), &meminfo), HOT);
+    }
+
+    #[test]
+    fn overview_meminfo_hot_rows_are_explicit_pressure_counters() {
+        let meminfo = meminfo(Bytes(100));
+
+        assert_eq!(MeminfoTone::for_key("Dirty"), MeminfoTone::Pressure);
+        assert_eq!(MeminfoTone::for_key("SUnreclaim"), MeminfoTone::Pressure);
+        assert_eq!(MeminfoTone::for_key("AnonPages"), MeminfoTone::Neutral);
+        assert_eq!(
+            MeminfoTone::Pressure.color(Bytes(0), &meminfo),
+            usage_color(Bytes(0), Bytes(100))
+        );
     }
 }
