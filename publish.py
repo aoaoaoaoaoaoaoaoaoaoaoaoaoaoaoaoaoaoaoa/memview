@@ -26,12 +26,12 @@ def require_clean_worktree() -> None:
         raise SystemExit(1)
 
 
-def sync_tracking_ref(remote: str) -> None:
+def verify_remote(remote: str) -> None:
     head = output("git", "ls-remote", remote, "refs/heads/main").split()[0]
     local = output("git", "rev-parse", "HEAD")
     if head != local:
         raise SystemExit(f"[publish] {remote}/main is {head}, expected {local}")
-    run("git", "update-ref", f"refs/remotes/{remote}/main", head)
+    print(f"[publish] verified {remote}/main {head}", flush=True)
 
 
 def main() -> None:
@@ -39,9 +39,9 @@ def main() -> None:
     run("./check.py", "install")
     require_clean_worktree()
     run("git", "push", "--follow-tags", "swarm", "main")
-    sync_tracking_ref("swarm")
+    verify_remote("swarm")
     run("git", "push", "--follow-tags", "github", "main")
-    sync_tracking_ref("github")
+    verify_remote("github")
 
 
 if __name__ == "__main__":
