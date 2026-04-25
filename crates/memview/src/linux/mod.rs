@@ -1,5 +1,11 @@
-use crate::app::{App, WorkerCommand, spawn_worker};
-use crate::ui;
+mod app;
+mod model;
+mod nav;
+mod probe;
+mod search;
+mod ui;
+
+use app::{App, WorkerCommand, spawn_worker};
 use clap::Parser;
 use color_eyre::eyre::Result;
 use crossterm::cursor::{Hide, Show};
@@ -27,7 +33,9 @@ struct Cli {
     refresh_ms: u64,
 }
 
-pub fn run() -> Result<()> {
+pub type MainResult = Result<()>;
+
+pub fn run() -> MainResult {
     color_eyre::install()?;
     let cli = Cli::parse();
     let (commands, events) = spawn_worker(Duration::from_millis(cli.refresh_ms));

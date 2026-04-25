@@ -1,4 +1,8 @@
-pub fn run() -> ! {
+use std::process::ExitCode;
+
+pub type MainResult = ExitCode;
+
+pub fn run() -> MainResult {
     eprintln!("memview is not supported on this system: Linux is required.");
-    std::process::exit(1);
+    ExitCode::FAILURE
 }

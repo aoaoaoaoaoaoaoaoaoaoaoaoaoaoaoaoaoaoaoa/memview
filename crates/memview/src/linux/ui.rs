@@ -1,6 +1,6 @@
-use crate::app::{App, FlatProcessRow, FlatSharedRow, FlatTmpfsRow, Hotkey, RowFold};
-use crate::model::{Bytes, Meminfo, MeminfoEntry, ObjectUsage, Pid, Snapshot, TmpfsMount};
-use crate::search::SearchRole;
+use super::app::{App, FlatProcessRow, FlatSharedRow, FlatTmpfsRow, Hotkey, RowFold};
+use super::model::{Bytes, Meminfo, MeminfoEntry, ObjectUsage, Pid, Snapshot, TmpfsMount};
+use super::search::SearchRole;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -46,10 +46,10 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
 
 fn render_body(frame: &mut Frame<'_>, app: &App, snapshot: &Snapshot, area: Rect) {
     match app.tab {
-        crate::app::Tab::Overview => render_overview(frame, app, snapshot, area),
-        crate::app::Tab::Processes => render_processes(frame, app, snapshot, area),
-        crate::app::Tab::Tmpfs => render_tmpfs(frame, app, snapshot, area),
-        crate::app::Tab::Shared => render_shared(frame, app, snapshot, area),
+        super::app::Tab::Overview => render_overview(frame, app, snapshot, area),
+        super::app::Tab::Processes => render_processes(frame, app, snapshot, area),
+        super::app::Tab::Tmpfs => render_tmpfs(frame, app, snapshot, area),
+        super::app::Tab::Shared => render_shared(frame, app, snapshot, area),
     }
 }
 
@@ -64,7 +64,7 @@ fn header(app: &App) -> Paragraph<'static> {
     ));
     spans.push(Span::raw("  "));
     for (index, label) in App::tab_labels().into_iter().enumerate() {
-        let style = if app.tab == crate::app::Tab::ALL[index] {
+        let style = if app.tab == super::app::Tab::ALL[index] {
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(MUTED)
@@ -163,23 +163,23 @@ fn footer(app: &App) -> Paragraph<'static> {
 
 fn pane_footer(app: &App) -> &'static str {
     match app.tab {
-        crate::app::Tab::Overview => "r refresh overview  s lens",
-        crate::app::Tab::Processes => {
+        super::app::Tab::Overview => "r refresh overview  s lens",
+        super::app::Tab::Processes => {
             "j/k/Pg/wheel move  gg/G edge  Enter fold  s sort  m mode  K SIGTERM  r rescan"
         }
-        crate::app::Tab::Tmpfs => {
+        super::app::Tab::Tmpfs => {
             "j/k/Pg/wheel move  gg/G edge  Enter fold  m mode  d delete  r refresh mount"
         }
-        crate::app::Tab::Shared => "j/k/Pg/wheel move  gg/G edge  s sort  m mode  r rescan",
+        super::app::Tab::Shared => "j/k/Pg/wheel move  gg/G edge  s sort  m mode  r rescan",
     }
 }
 
 fn render_loading(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let (title, message) = match app.tab {
-        crate::app::Tab::Overview => ("Loading", "Reading kernel memory counters..."),
-        crate::app::Tab::Processes => ("Processes", "Capturing process memory snapshot..."),
-        crate::app::Tab::Tmpfs => ("Tmpfs", "Scanning tmpfs mounts..."),
-        crate::app::Tab::Shared => ("Shared", "Reading shared memory ledgers..."),
+        super::app::Tab::Overview => ("Loading", "Reading kernel memory counters..."),
+        super::app::Tab::Processes => ("Processes", "Capturing process memory snapshot..."),
+        super::app::Tab::Tmpfs => ("Tmpfs", "Scanning tmpfs mounts..."),
+        super::app::Tab::Shared => ("Shared", "Reading shared memory ledgers..."),
     };
     frame.render_widget(
         Paragraph::new(message)

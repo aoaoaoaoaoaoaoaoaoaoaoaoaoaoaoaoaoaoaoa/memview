@@ -1,4 +1,4 @@
-use crate::model::Bytes;
+use super::model::Bytes;
 use regex::Regex;
 
 #[derive(Clone, Debug)]

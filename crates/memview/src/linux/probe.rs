@@ -1,4 +1,4 @@
-use crate::model::{
+use super::model::{
     Bytes, LedgerState, Meminfo, MeminfoEntry, MemoryRollup, Metric, ObjectConsumer, ObjectKind,
     ObjectUsage, Overview, Pid, ProcessNode, ProcessTree, ProcessTreeStats, SharedObject, Snapshot,
     SysvSegment, TmpfsMount, TmpfsNode, TmpfsNodeKind,

@@ -1,5 +1,5 @@
-use crate::model::{Pid, Snapshot};
-use crate::probe;
+use super::super::model::{Pid, Snapshot};
+use super::super::probe;
 use color_eyre::eyre::Result;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};

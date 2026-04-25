@@ -1,10 +1,10 @@
-use crate::model::{
+use super::model::{
     Bytes, LedgerState, Meminfo, Metric, ObjectKind, ObjectUsage, Pid, ProcessNode, SharedObject,
     Snapshot, TmpfsMount, TmpfsNode, TmpfsNodeKind,
 };
-pub use crate::nav::{Hotkey, HotkeySections, Tab};
-use crate::probe;
-use crate::search::{Search, SearchDraft, SearchRole, SearchSummary};
+pub use super::nav::{Hotkey, HotkeySections, Tab};
+use super::probe;
+use super::search::{Search, SearchDraft, SearchRole, SearchSummary};
 use color_eyre::eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use rustix::fd::OwnedFd;
@@ -48,7 +48,7 @@ impl ProcessScope {
     }
 
     #[must_use]
-    pub fn rollup(self, node: &ProcessNode) -> crate::model::MemoryRollup {
+    pub fn rollup(self, node: &ProcessNode) -> super::model::MemoryRollup {
         match self {
             Self::SelfOnly => node.rollup,
             Self::SelfAndChildren => node.subtree,
@@ -922,7 +922,7 @@ impl App {
     #[must_use]
     pub fn hotkey_sections(&self) -> HotkeySections {
         HotkeySections {
-            global: crate::nav::global_hotkeys(),
+            global: super::nav::global_hotkeys(),
             pane_title: self.tab.title(),
             pane: self.tab.hotkeys(),
         }
@@ -1759,8 +1759,8 @@ fn empty_snapshot(meminfo: Meminfo) -> Snapshot {
         captured_at: SystemTime::now(),
         elapsed: Duration::ZERO,
         meminfo,
-        overview: crate::model::Overview::default(),
-        process_tree: crate::model::ProcessTree::default(),
+        overview: super::model::Overview::default(),
+        process_tree: super::model::ProcessTree::default(),
         shared_objects: Vec::new(),
         sysv_segments: Vec::new(),
         tmpfs_mounts: Vec::new(),
