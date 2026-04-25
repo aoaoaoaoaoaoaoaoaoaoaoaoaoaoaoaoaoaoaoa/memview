@@ -155,8 +155,8 @@ def registry_token() -> str:
 def publish_crate(version: Version) -> None:
     run("./check.py", "verify")
     run("cargo", "publish", "--dry-run", "--locked", "-p", "memview")
-    run_with_token("cargo", "publish", "--locked", "-p", "memview")
     ensure_tag(version)
+    run_with_token("cargo", "publish", "--locked", "-p", "memview")
 
 
 def verify_remote(remote: str) -> None:
