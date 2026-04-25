@@ -1,0 +1,1076 @@
+use crate::app::{App, FlatProcessRow, FlatSharedRow, FlatTmpfsRow, Hotkey, RowFold};
+use crate::model::{Bytes, MeminfoEntry, ObjectUsage, Pid, Snapshot, TmpfsMount};
+use crate::search::SearchRole;
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
+use std::time::Duration;
+
+const BG: Color = Color::Rgb(12, 17, 24);
+const FG: Color = Color::Rgb(221, 227, 234);
+const MUTED: Color = Color::Rgb(129, 145, 160);
+const ACCENT: Color = Color::Rgb(64, 184, 173);
+const HOT: Color = Color::Rgb(227, 116, 94);
+const GOLD: Color = Color::Rgb(236, 180, 71);
+
+pub fn render(frame: &mut Frame<'_>, app: &App) {
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(2),
+        ])
+        .split(area);
+
+    frame.render_widget(header(app), chunks[0]);
+    match app.snapshot.as_ref() {
+        Some(snapshot) => render_body(frame, app, snapshot, chunks[1]),
+        None => render_loading(frame, app, chunks[1]),
+    }
+    frame.render_widget(footer(app), chunks[2]);
+
+    if app.show_help {
+        render_help(frame, app, area);
+    }
+    if app.kill_confirmation.is_some() {
+        render_kill_confirmation(frame, app, area);
+    }
+    if app.search_draft().is_some() {
+        render_search_prompt(frame, app, area);
+    }
+}
+
+fn render_body(frame: &mut Frame<'_>, app: &App, snapshot: &Snapshot, area: Rect) {
+    match app.tab {
+        crate::app::Tab::Overview => render_overview(frame, app, snapshot, area),
+        crate::app::Tab::Processes => render_processes(frame, app, snapshot, area),
+        crate::app::Tab::Tmpfs => render_tmpfs(frame, app, snapshot, area),
+        crate::app::Tab::Shared => render_shared(frame, app, snapshot, area),
+    }
+}
+
+fn header(app: &App) -> Paragraph<'static> {
+    let mut spans = Vec::new();
+    spans.push(Span::styled(
+        " memview ",
+        Style::default()
+            .fg(BG)
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::raw("  "));
+    for (index, label) in App::tab_labels().into_iter().enumerate() {
+        let style = if app.tab == crate::app::Tab::ALL[index] {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(MUTED)
+        };
+        spans.push(Span::styled(label, style));
+        spans.push(Span::raw("  "));
+    }
+    spans.push(Span::styled(
+        format!("sort {}", app.metric.label()),
+        Style::default().fg(GOLD),
+    ));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        format!("mode {}", app.process_scope.label()),
+        Style::default().fg(ACCENT),
+    ));
+
+    Paragraph::new(Line::from(spans))
+        .block(panel("Memory Ledger"))
+        .style(Style::default().fg(FG).bg(BG))
+}
+
+fn footer(app: &App) -> Paragraph<'static> {
+    let mut spans = Vec::new();
+    if let Some(pattern) = app.search_pattern() {
+        spans.push(Span::styled(
+            format!(" FILTER /{pattern}/ "),
+            Style::default()
+                .fg(BG)
+                .bg(GOLD)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            "f clear",
+            Style::default().fg(HOT).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw("  "));
+    }
+    spans.push(Span::styled(
+        format!(
+            "q quit  / search  ? help  {}  {}",
+            pane_footer(app),
+            app.current_time_label()
+        ),
+        Style::default().fg(MUTED),
+    ));
+    if let Some(error) = &app.last_error {
+        spans.push(Span::styled("  last error: ", Style::default().fg(HOT)));
+        spans.push(Span::styled(error.clone(), Style::default().fg(HOT)));
+    }
+    if app.deletion_count() > 0 {
+        spans.push(Span::styled(
+            format!("  deleting {} in background", app.deletion_count()),
+            Style::default().fg(HOT),
+        ));
+    }
+    if let Some(confirmation) = &app.kill_confirmation {
+        if confirmation.armed() {
+            spans.push(Span::styled(
+                "  SIGTERM armed: y confirms",
+                Style::default().fg(HOT).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(
+                format!(
+                    "  SIGTERM locked {} ms",
+                    confirmation.lock_remaining().as_millis()
+                ),
+                Style::default().fg(GOLD),
+            ));
+        }
+    }
+    if app.tab.drives_process_scans()
+        && let Some(started) = app.process_scan_started_at
+    {
+        spans.push(Span::styled(
+            format!("  process scan {} ms", started.elapsed().as_millis()),
+            Style::default().fg(MUTED),
+        ));
+    }
+    if let Some((pid, started)) = app.process_mapping_started_at() {
+        spans.push(Span::styled(
+            format!("  mappings {pid} {} ms", started.elapsed().as_millis()),
+            Style::default().fg(MUTED),
+        ));
+    }
+    if let Some(started) = app.shared_scan_started_at() {
+        spans.push(Span::styled(
+            format!("  shared ledger {} ms", started.elapsed().as_millis()),
+            Style::default().fg(MUTED),
+        ));
+    }
+    Paragraph::new(Line::from(spans)).style(Style::default().bg(BG))
+}
+
+fn pane_footer(app: &App) -> &'static str {
+    match app.tab {
+        crate::app::Tab::Overview => "r refresh overview  s lens",
+        crate::app::Tab::Processes => {
+            "j/k/Pg/wheel move  gg/G edge  Enter fold  s sort  m mode  K SIGTERM  r rescan"
+        }
+        crate::app::Tab::Tmpfs => {
+            "j/k/Pg/wheel move  gg/G edge  Enter fold  m mode  d delete  r refresh mount"
+        }
+        crate::app::Tab::Shared => "j/k/Pg/wheel move  gg/G edge  s sort  m mode  r rescan",
+    }
+}
+
+fn render_loading(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let (title, message) = match app.tab {
+        crate::app::Tab::Overview => ("Loading", "Reading kernel memory counters..."),
+        crate::app::Tab::Processes => ("Processes", "Capturing process memory snapshot..."),
+        crate::app::Tab::Tmpfs => ("Tmpfs", "Scanning tmpfs mounts..."),
+        crate::app::Tab::Shared => ("Shared", "Reading shared memory ledgers..."),
+    };
+    frame.render_widget(
+        Paragraph::new(message)
+            .block(panel(title))
+            .style(Style::default().fg(FG)),
+        area,
+    );
+}
+
+fn render_overview(frame: &mut Frame<'_>, _app: &App, snapshot: &Snapshot, area: Rect) {
+    let capacity = snapshot.meminfo.get("MemTotal");
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+        .split(area);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(11), Constraint::Min(8)])
+        .split(columns[1]);
+
+    let mem_rows = snapshot
+        .meminfo
+        .entries
+        .iter()
+        .map(|entry| row_meminfo(entry, capacity))
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Table::new(
+            mem_rows,
+            [
+                Constraint::Length(18),
+                Constraint::Length(16),
+                Constraint::Length(8),
+            ],
+        )
+        .header(header_row(["Kernel Counter", "Value", "% total"]))
+        .block(panel("meminfo"))
+        .column_spacing(1),
+        columns[0],
+    );
+
+    let overview_rows = vec![
+        summary_row(
+            "Σ process PSS",
+            snapshot.overview.process_pss_total,
+            capacity,
+        ),
+        summary_row(
+            "Σ process USS",
+            snapshot.overview.process_uss_total,
+            capacity,
+        ),
+        summary_row(
+            "Σ process RSS",
+            snapshot.overview.process_rss_total,
+            capacity,
+        ),
+        summary_row(
+            "Σ process SwapPSS",
+            snapshot.overview.process_swap_pss_total,
+            capacity,
+        ),
+        summary_row(
+            "Σ process PSS anon",
+            snapshot.overview.process_pss_anon_total,
+            capacity,
+        ),
+        summary_row(
+            "Σ process PSS file",
+            snapshot.overview.process_pss_file_total,
+            capacity,
+        ),
+        summary_row(
+            "Σ process PSS shmem",
+            snapshot.overview.process_pss_shmem_total,
+            capacity,
+        ),
+        summary_row(
+            "Σ tmpfs allocated",
+            snapshot.overview.tmpfs_allocated_total,
+            capacity,
+        ),
+        summary_row("Σ SysV shm RSS", snapshot.overview.sysv_rss_total, capacity),
+        summary_text_row("processes", &snapshot.overview.process_count.to_string()),
+        summary_text_row("SysV segments", &snapshot.sysv_segments.len().to_string()),
+        summary_text_row("scan millis", &snapshot.elapsed.as_millis().to_string()),
+        summary_row(
+            "inaccessible rollups",
+            Bytes(snapshot.overview.inaccessible_rollups as u64),
+            capacity,
+        ),
+        summary_row(
+            "inaccessible maps",
+            Bytes(snapshot.overview.inaccessible_maps as u64),
+            capacity,
+        ),
+    ];
+    frame.render_widget(
+        Table::new(
+            overview_rows,
+            [Constraint::Length(24), Constraint::Length(16)],
+        )
+        .header(header_row(["Lens", "Value"]))
+        .block(panel("reconciliation"))
+        .column_spacing(1),
+        right[0],
+    );
+
+    let warning_lines = if snapshot.warnings.is_empty() {
+        vec![Line::from(Span::styled(
+            "No probe warnings. PSS is the attribution lens; tmpfs uses allocated blocks.",
+            Style::default().fg(FG),
+        ))]
+    } else {
+        snapshot
+            .warnings
+            .iter()
+            .take(24)
+            .map(|warning| Line::from(Span::styled(warning.clone(), Style::default().fg(HOT))))
+            .collect::<Vec<_>>()
+    };
+    frame.render_widget(
+        Paragraph::new(warning_lines)
+            .block(panel("probe notes"))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(FG)),
+        right[1],
+    );
+}
+
+fn render_processes(frame: &mut Frame<'_>, app: &App, snapshot: &Snapshot, area: Rect) {
+    let capacity = snapshot.meminfo.get("MemTotal");
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(57), Constraint::Percentage(43)])
+        .split(area);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(12), Constraint::Min(8)])
+        .split(columns[1]);
+
+    if snapshot.process_tree.nodes.is_empty() && app.process_scan_started_at.is_some() {
+        frame.render_widget(
+            Paragraph::new("Capturing process memory snapshot...")
+                .block(panel("process tree"))
+                .style(Style::default().fg(FG)),
+            columns[0],
+        );
+        frame.render_widget(
+            Paragraph::new("Per-process PSS, mappings, and object consumers will appear here.")
+                .block(panel("selected process"))
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(MUTED)),
+            right[0],
+        );
+        return;
+    }
+
+    let rows = app.process_rows();
+    let selected = app.selected_process_row();
+    let visible = slice_window(rows, selected, columns[0].height.saturating_sub(4) as usize);
+    let process_rows = visible
+        .iter()
+        .enumerate()
+        .map(|(offset, row)| {
+            row_process(
+                app,
+                snapshot,
+                row,
+                visible.start + offset == selected,
+                capacity,
+            )
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Table::new(
+            process_rows,
+            [
+                Constraint::Length(30),
+                Constraint::Length(8),
+                Constraint::Length(8),
+                Constraint::Length(9),
+                Constraint::Length(9),
+                Constraint::Length(9),
+                Constraint::Min(24),
+            ],
+        )
+        .header(header_row([
+            "Task", "PID", "User", "PSS", "USS", "RSS", "Command",
+        ]))
+        .block(panel(&format!(
+            "process tree ({})",
+            app.process_scope.label()
+        )))
+        .column_spacing(1),
+        columns[0],
+    );
+
+    if let Some(process) = app.selected_process() {
+        let mut details = search_summary_lines(app, capacity);
+        details.extend([
+            Line::from(vec![Span::styled(
+                process.title(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )]),
+            detail_line("State", &process.state),
+            detail_line("Threads", &process.threads.to_string()),
+            detail_line("PSS", &process.rollup.pss.human_exact()),
+            detail_line("USS", &process.rollup.uss().human_exact()),
+            detail_line("RSS", &process.rollup.rss.human_exact()),
+            detail_line("PSS anon", &process.rollup.pss_anon.human_exact()),
+            detail_line("PSS file", &process.rollup.pss_file.human_exact()),
+            detail_line("PSS shmem", &process.rollup.pss_shmem.human_exact()),
+            detail_line("SwapPSS", &process.rollup.swap_pss.human_exact()),
+            detail_line(
+                "Access",
+                &format!(
+                    "rollup={} maps={}",
+                    process.rollup_state.label(),
+                    app.selected_process_mapping_status()
+                ),
+            ),
+            detail_line("Map scan", &app.selected_process_mapping_scan_label()),
+        ]);
+        frame.render_widget(
+            Paragraph::new(details)
+                .block(panel("selected process"))
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(FG)),
+            right[0],
+        );
+    } else if app.search_summary().is_some() {
+        frame.render_widget(
+            Paragraph::new(search_summary_lines(app, capacity))
+                .block(panel("search total"))
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(FG)),
+            right[0],
+        );
+    }
+
+    if let Some((pid, elapsed)) = app.selected_process_mapping_loading() {
+        frame.render_widget(mapping_loading(pid, elapsed), right[1]);
+    } else {
+        let objects = app.selected_process_objects();
+        let object_rows = slice_window(objects, 0, right[1].height.saturating_sub(4) as usize)
+            .iter()
+            .map(|object| row_object_usage(object, capacity))
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Table::new(
+                object_rows,
+                [
+                    Constraint::Length(9),
+                    Constraint::Length(10),
+                    Constraint::Length(10),
+                    Constraint::Length(7),
+                    Constraint::Min(24),
+                ],
+            )
+            .header(header_row(["Kind", "PSS", "RSS", "VMAs", "Object"]))
+            .block(panel("selected mappings"))
+            .column_spacing(1),
+            right[1],
+        );
+    }
+}
+
+fn mapping_loading(pid: Pid, elapsed: Duration) -> Paragraph<'static> {
+    let dots = ".".repeat(((elapsed.as_millis() / 250) % 4) as usize);
+    Paragraph::new(vec![
+        Line::from(vec![Span::styled(
+            format!("Loading /proc/{pid}/smaps{dots}"),
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("elapsed ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("{} ms", elapsed.as_millis()),
+                Style::default().fg(FG),
+            ),
+        ]),
+        Line::from(""),
+        Line::from("The kernel synthesizes per-VMA PSS/RSS here; large mapping tables can stall."),
+    ])
+    .block(panel("selected mappings"))
+    .wrap(Wrap { trim: false })
+    .style(Style::default().fg(FG))
+}
+
+fn render_tmpfs(frame: &mut Frame<'_>, app: &App, _snapshot: &Snapshot, area: Rect) {
+    let capacity = app
+        .snapshot
+        .as_ref()
+        .map_or(Bytes::ZERO, |snapshot| snapshot.meminfo.get("MemTotal"));
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(area);
+    let rows = app.tmpfs_rows();
+    let selected = app.selected_tmpfs_row();
+    let visible = slice_window(rows, selected, columns[0].height.saturating_sub(4) as usize);
+    let table_rows = visible
+        .iter()
+        .enumerate()
+        .map(|(offset, row)| row_tmpfs(row, visible.start + offset == selected, capacity))
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Table::new(
+            table_rows,
+            [
+                Constraint::Length(32),
+                Constraint::Length(8),
+                Constraint::Length(12),
+                Constraint::Length(12),
+                Constraint::Min(20),
+            ],
+        )
+        .header(header_row([
+            "Entry",
+            "Kind",
+            "Allocated",
+            "Logical",
+            "Path",
+        ]))
+        .block(panel("tmpfs tree"))
+        .column_spacing(1),
+        columns[0],
+    );
+
+    let mut detail_lines = search_summary_lines(app, capacity);
+    detail_lines.extend(
+        match (app.selected_tmpfs_mount(), app.selected_tmpfs_entry()) {
+            (Some(mount), Some(row)) => tmpfs_detail_lines(mount, row),
+            _ => vec![Line::from("No tmpfs node selected")],
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(detail_lines)
+            .block(panel("selected tmpfs entry"))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(FG)),
+        columns[1],
+    );
+}
+
+fn render_shared(frame: &mut Frame<'_>, app: &App, snapshot: &Snapshot, area: Rect) {
+    let capacity = snapshot.meminfo.get("MemTotal");
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(area);
+    let rows = app.shared_rows();
+    let selected = app.selected_shared_row();
+    let visible = slice_window(rows, selected, columns[0].height.saturating_sub(4) as usize);
+    let rows = visible
+        .iter()
+        .enumerate()
+        .map(|(offset, row)| {
+            row_shared(snapshot, row, visible.start + offset == selected, capacity)
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(8),
+                Constraint::Length(7),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(7),
+                Constraint::Min(24),
+            ],
+        )
+        .header(header_row([
+            "Kind", "Tasks", "PSS", "RSS", "VMAs", "Object",
+        ]))
+        .block(panel("global object ledger"))
+        .column_spacing(1),
+        columns[0],
+    );
+
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(8), Constraint::Min(8)])
+        .split(columns[1]);
+    if let Some(object) = app.selected_shared_object() {
+        let mut summary = search_summary_lines(app, capacity);
+        summary.extend([
+            Line::from(Span::styled(
+                object.label.clone(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )),
+            detail_line("Kind", object.kind.label()),
+            detail_line("PSS", &object.rollup.pss.human_exact()),
+            detail_line("RSS", &object.rollup.rss.human_exact()),
+            detail_line("Swap", &object.rollup.swap.human_exact()),
+            detail_line("Tasks", &object.mapped_processes.to_string()),
+            detail_line("VMAs", &object.regions.to_string()),
+        ]);
+        frame.render_widget(
+            Paragraph::new(summary)
+                .block(panel("selected object"))
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(FG)),
+            right[0],
+        );
+
+        let consumers = slice_window(
+            &object.consumers,
+            0,
+            right[1].height.saturating_sub(4) as usize,
+        )
+        .iter()
+        .map(|consumer| {
+            Row::new(vec![
+                Cell::from(consumer.pid.to_string()),
+                usage_cell(consumer.rollup.pss, capacity),
+                usage_cell(consumer.rollup.rss, capacity),
+                Cell::from(consumer.name.clone()),
+                Cell::from(consumer.command.clone()),
+            ])
+            .style(usage_style(false, consumer.rollup.pss, capacity))
+        })
+        .collect::<Vec<_>>();
+        frame.render_widget(
+            Table::new(
+                consumers,
+                [
+                    Constraint::Length(8),
+                    Constraint::Length(10),
+                    Constraint::Length(10),
+                    Constraint::Length(16),
+                    Constraint::Min(20),
+                ],
+            )
+            .header(header_row(["PID", "PSS", "RSS", "Name", "Command"]))
+            .block(panel("top consumers"))
+            .column_spacing(1),
+            right[1],
+        );
+    } else if app.search_summary().is_some() {
+        frame.render_widget(
+            Paragraph::new(search_summary_lines(app, capacity))
+                .block(panel("search total"))
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(FG)),
+            right[0],
+        );
+    }
+}
+
+fn row_meminfo(entry: &MeminfoEntry, total: Bytes) -> Row<'static> {
+    Row::new(vec![
+        Cell::from(entry.key.clone()),
+        usage_cell(entry.value, total),
+        Cell::from(format!("{:.1}", entry.value.pct_of(total)))
+            .style(Style::default().fg(usage_color(entry.value, total))),
+    ])
+    .style(usage_style(false, entry.value, total))
+}
+
+fn summary_row(label: &str, value: Bytes, total: Bytes) -> Row<'static> {
+    Row::new(vec![
+        Cell::from(label.to_string()),
+        usage_cell(value, total),
+    ])
+    .style(usage_style(false, value, total))
+}
+
+fn summary_text_row(label: &str, value: &str) -> Row<'static> {
+    Row::new(vec![
+        Cell::from(label.to_string()),
+        Cell::from(value.to_string()),
+    ])
+}
+
+fn row_process(
+    app: &App,
+    snapshot: &Snapshot,
+    row: &FlatProcessRow,
+    selected: bool,
+    capacity: Bytes,
+) -> Row<'static> {
+    let node = &snapshot.process_tree.nodes[row.index];
+    let rollup = app.process_scope.rollup(node);
+    let marker = match row.fold {
+        RowFold::Leaf => " ",
+        RowFold::Collapsed => "▸",
+        RowFold::Expanded => "▾",
+    };
+    let name = format!("{}{} {}", "  ".repeat(row.depth), marker, node.name);
+    Row::new(vec![
+        Cell::from(name),
+        Cell::from(node.pid.to_string()),
+        Cell::from(node.username.clone()),
+        usage_cell(rollup.pss, capacity),
+        usage_cell(rollup.uss(), capacity),
+        usage_cell(rollup.rss, capacity),
+        Cell::from(node.command.clone()),
+    ])
+    .style(usage_style_for_role(
+        selected,
+        rollup.metric(app.metric),
+        capacity,
+        row.search,
+    ))
+}
+
+fn row_tmpfs(row: &FlatTmpfsRow, selected: bool, capacity: Bytes) -> Row<'static> {
+    let marker = match row.fold {
+        RowFold::Leaf => " ",
+        RowFold::Collapsed => "▸",
+        RowFold::Expanded => "▾",
+    };
+    let label = format!("{}{} {}", "  ".repeat(row.depth), marker, row.name);
+    Row::new(vec![
+        Cell::from(label),
+        Cell::from(row.kind.label().to_string()),
+        usage_cell(row.allocated, capacity),
+        usage_cell(row.logical, capacity),
+        Cell::from(row.path.display().to_string()),
+    ])
+    .style(usage_style_for_role(
+        selected,
+        row.allocated,
+        capacity,
+        row.search,
+    ))
+}
+
+fn row_shared(
+    snapshot: &Snapshot,
+    row: &FlatSharedRow,
+    selected: bool,
+    capacity: Bytes,
+) -> Row<'static> {
+    let object = &snapshot.shared_objects[row.index];
+    Row::new(vec![
+        Cell::from(object.kind.label().to_string()),
+        Cell::from(object.mapped_processes.to_string()),
+        usage_cell(object.rollup.pss, capacity),
+        usage_cell(object.rollup.rss, capacity),
+        Cell::from(object.regions.to_string()),
+        Cell::from(object.label.clone()),
+    ])
+    .style(usage_style_for_role(
+        selected,
+        object.rollup.pss,
+        capacity,
+        row.search,
+    ))
+}
+
+fn row_object_usage(object: &ObjectUsage, capacity: Bytes) -> Row<'static> {
+    Row::new(vec![
+        Cell::from(object.kind.label().to_string()),
+        usage_cell(object.rollup.pss, capacity),
+        usage_cell(object.rollup.rss, capacity),
+        Cell::from(object.regions.to_string()),
+        Cell::from(object.label.clone()),
+    ])
+    .style(usage_style(false, object.rollup.pss, capacity))
+}
+
+fn tmpfs_detail_lines(mount: &TmpfsMount, row: &FlatTmpfsRow) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            row.path.display().to_string(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        detail_line("Mount", &mount.mount_point.display().to_string()),
+        detail_line("Source", &mount.source),
+        detail_line("Kind", row.kind.label()),
+        detail_line("Allocated", &row.allocated.human_exact()),
+        detail_line("Logical", &row.logical.human_exact()),
+    ];
+    if let Some(limit) = mount.size_limit {
+        lines.push(detail_line("Mount size", &limit.human_exact()));
+        lines.push(detail_line(
+            "Utilization",
+            &format!("{:.1}%", row.allocated.pct_of(limit)),
+        ));
+    }
+    lines
+}
+
+fn search_summary_lines(app: &App, capacity: Bytes) -> Vec<Line<'static>> {
+    let Some(summary) = app.search_summary() else {
+        return Vec::new();
+    };
+    let pattern = app.search_pattern().unwrap_or_default();
+    vec![
+        Line::from(Span::styled(
+            "regexp matches",
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        )),
+        detail_line("regexp", &format!("/{pattern}/")),
+        detail_line("matches", &summary.matches.to_string()),
+        detail_line(summary.lens, &summary.total.human_exact()),
+        detail_line(
+            "pct total",
+            &format!("{:.2}%", summary.total.pct_of(capacity)),
+        ),
+        detail_line("mode", app.search_scope_label()),
+        Line::from(""),
+    ]
+}
+
+fn detail_line(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:>12} "), Style::default().fg(MUTED)),
+        Span::styled(value.to_string(), Style::default().fg(FG)),
+    ])
+}
+
+fn header_row<const N: usize>(values: [&str; N]) -> Row<'static> {
+    Row::new(
+        values
+            .into_iter()
+            .map(|value| Cell::from(value.to_string())),
+    )
+    .style(Style::default().fg(GOLD).add_modifier(Modifier::BOLD))
+}
+
+fn usage_style(selected: bool, value: Bytes, total: Bytes) -> Style {
+    row_fg_style(selected, usage_color(value, total))
+}
+
+fn usage_style_for_role(selected: bool, value: Bytes, total: Bytes, role: SearchRole) -> Style {
+    if role.is_context() && !selected {
+        Style::default().fg(MUTED)
+    } else {
+        usage_style(selected, value, total)
+    }
+}
+
+fn row_fg_style(selected: bool, fg: Color) -> Style {
+    if selected {
+        Style::default()
+            .fg(fg)
+            .bg(Color::Rgb(28, 44, 61))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(fg)
+    }
+}
+
+fn usage_cell(value: Bytes, total: Bytes) -> Cell<'static> {
+    Cell::from(value.human_iec()).style(Style::default().fg(usage_color(value, total)))
+}
+
+fn usage_color(value: Bytes, total: Bytes) -> Color {
+    if value.0 == 0 || total.0 == 0 {
+        return Color::Rgb(105, 113, 121);
+    }
+
+    let pct = (value.as_f64() / total.as_f64()).clamp(0.0, 1.0);
+    if pct <= 0.03 {
+        return blend_rgb((105, 113, 121), (246, 248, 250), pct / 0.03);
+    }
+    blend_rgb((246, 248, 250), (232, 58, 46), (pct - 0.03) / 0.97)
+}
+
+fn blend_rgb(start: (u8, u8, u8), end: (u8, u8, u8), t: f64) -> Color {
+    Color::Rgb(
+        blend_channel(start.0, end.0, t),
+        blend_channel(start.1, end.1, t),
+        blend_channel(start.2, end.2, t),
+    )
+}
+
+fn blend_channel(start: u8, end: u8, t: f64) -> u8 {
+    (f64::from(start) + (f64::from(end) - f64::from(start)) * t)
+        .round()
+        .clamp(0.0, 255.0) as u8
+}
+
+fn panel(title: &str) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .title(title.to_string())
+        .style(Style::default().fg(FG).bg(BG))
+}
+
+fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let popup = centered_rect(area, 82, 88);
+    frame.render_widget(Clear, popup);
+    let hotkeys = app.hotkey_sections();
+    let mut text = vec![
+        Line::from(Span::styled(
+            "memview keys",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        section_heading("Global"),
+    ];
+    text.extend(hotkeys.global.iter().map(hotkey_line));
+    text.extend([
+        Line::from(""),
+        section_heading(&format!("Pane: {}", hotkeys.pane_title)),
+    ]);
+    text.extend(hotkeys.pane.iter().map(hotkey_line));
+    text.extend([
+        Line::from(""),
+        section_heading("Notes"),
+        Line::from("Overview shows raw kernel counters and the main reconciliation lenses."),
+        Line::from("Processes uses PSS so shared pages are not double-counted."),
+        Line::from(
+            "Tmpfs uses allocated blocks, which is closer to actual backing than file length.",
+        ),
+        Line::from("Tree panes auto-fold subtrees below min(1% RAM, 3% largest non-root subtree)."),
+        Line::from(
+            "Shared aggregates mapped objects across tasks: tmpfs, memfd, SYSV, files, and anon.",
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(panel("Help"))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(FG)),
+        popup,
+    );
+}
+
+fn section_heading(label: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        label.to_string(),
+        Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn hotkey_line(hotkey: &Hotkey) -> Line<'static> {
+    detail_line(hotkey.key, hotkey.action)
+}
+
+fn render_kill_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(confirmation) = app.kill_confirmation.as_ref() else {
+        return;
+    };
+
+    let popup = centered_rect(area, 88, 88);
+    frame.render_widget(Clear, popup);
+    let block = panel("kill");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+
+    let top = vec![
+        Line::from(Span::styled(
+            "Send SIGTERM to this process?",
+            Style::default().fg(HOT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        detail_line("PID", &confirmation.target.pid.to_string()),
+        detail_line("Name", &confirmation.target.name),
+    ];
+    frame.render_widget(
+        Paragraph::new(top).style(Style::default().fg(FG)),
+        sections[0],
+    );
+
+    frame.render_widget(
+        Paragraph::new(confirmation.target.cli().to_string())
+            .block(
+                Block::default()
+                    .borders(Borders::TOP | Borders::BOTTOM)
+                    .title("Full CLI")
+                    .style(Style::default().fg(ACCENT).bg(BG)),
+            )
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(FG).bg(BG)),
+        sections[1],
+    );
+
+    let mut controls = Vec::new();
+    if confirmation.armed() {
+        controls.push(Line::from(Span::styled(
+            "press y to send SIGTERM",
+            Style::default().fg(HOT).add_modifier(Modifier::BOLD),
+        )));
+    } else {
+        controls.push(detail_line(
+            "lockout",
+            &format!(
+                "{} ms before y is accepted",
+                confirmation.lock_remaining().as_millis()
+            ),
+        ));
+    }
+    controls.push(detail_line("cancel", "Esc or n"));
+
+    frame.render_widget(
+        Paragraph::new(controls)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(FG).bg(BG)),
+        sections[2],
+    );
+}
+
+fn render_search_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(draft) = app.search_draft() else {
+        return;
+    };
+
+    let popup = centered_rect(area, 76, 22);
+    frame.render_widget(Clear, popup);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Filter rows by regexp",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("/", Style::default().fg(GOLD)),
+            Span::styled(draft.input().to_string(), Style::default().fg(FG)),
+        ]),
+        Line::from(""),
+        detail_line("accept", "Enter"),
+        detail_line("clear", "empty input, then Enter"),
+        detail_line("cancel", "Esc"),
+    ];
+    if let Some(error) = draft.error() {
+        lines.push(detail_line("error", error));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(panel("search"))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(FG)),
+        popup,
+    );
+}
+
+fn centered_rect(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - height_pct) / 2),
+            Constraint::Percentage(height_pct),
+            Constraint::Percentage((100 - height_pct) / 2),
+        ])
+        .split(area);
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - width_pct) / 2),
+            Constraint::Percentage(width_pct),
+            Constraint::Percentage((100 - width_pct) / 2),
+        ])
+        .split(vertical[1]);
+    horizontal[1]
+}
+
+struct SliceWindow<'a, T> {
+    start: usize,
+    slice: &'a [T],
+}
+
+impl<T> std::ops::Deref for SliceWindow<'_, T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        self.slice
+    }
+}
+
+fn slice_window<T>(items: &[T], selected: usize, height: usize) -> SliceWindow<'_, T> {
+    if items.is_empty() {
+        return SliceWindow {
+            start: 0,
+            slice: items,
+        };
+    }
+    let height = height.max(1);
+    let half = height / 2;
+    let start = selected
+        .saturating_sub(half)
+        .min(items.len().saturating_sub(height));
+    let end = (start + height).min(items.len());
+    SliceWindow {
+        start,
+        slice: &items[start..end],
+    }
+}
