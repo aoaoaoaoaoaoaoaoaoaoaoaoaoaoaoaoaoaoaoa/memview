@@ -295,7 +295,7 @@ fn render_processes(frame: &mut Frame<'_>, app: &App, snapshot: &Snapshot, area:
         .split(area);
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(12), Constraint::Min(8)])
+        .constraints([Constraint::Length(16), Constraint::Min(8)])
         .split(columns[1]);
 
     if snapshot.process_tree.nodes.is_empty() && app.process_scan_started_at.is_some() {
@@ -357,11 +357,14 @@ fn render_processes(frame: &mut Frame<'_>, app: &App, snapshot: &Snapshot, area:
 
     if let Some(process) = app.selected_process() {
         let mut details = search_summary_lines(app, capacity);
+        details.push(Line::from(vec![Span::styled(
+            process.title(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )]));
+        if let Some(cwd) = &process.cwd {
+            details.push(detail_line("CWD", cwd.as_str()));
+        }
         details.extend([
-            Line::from(vec![Span::styled(
-                process.title(),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            )]),
             detail_line("State", &process.state),
             detail_line("Threads", &process.threads.to_string()),
             detail_line("PSS", &process.rollup.pss.human_exact()),

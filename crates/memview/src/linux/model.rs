@@ -313,6 +313,7 @@ pub struct ProcessNode {
     pub ppid: Option<Pid>,
     pub name: String,
     pub command: String,
+    pub cwd: Option<ProcessCwd>,
     pub username: String,
     pub state: String,
     pub threads: u32,
@@ -332,6 +333,27 @@ impl ProcessNode {
         } else {
             format!("{} [{}] {}", self.name, self.pid, self.command)
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessCwd(String);
+
+impl ProcessCwd {
+    #[must_use]
+    pub fn new(path: PathBuf) -> Self {
+        Self(path.display().to_string())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Display for ProcessCwd {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 

@@ -1,7 +1,7 @@
 use super::model::{
     Bytes, LedgerState, Meminfo, MeminfoEntry, MemoryRollup, Metric, ObjectConsumer, ObjectKind,
-    ObjectUsage, Overview, Pid, ProcessNode, ProcessTree, ProcessTreeStats, SharedObject, Snapshot,
-    SysvSegment, TmpfsMount, TmpfsNode, TmpfsNodeKind,
+    ObjectUsage, Overview, Pid, ProcessCwd, ProcessNode, ProcessTree, ProcessTreeStats,
+    SharedObject, Snapshot, SysvSegment, TmpfsMount, TmpfsNode, TmpfsNodeKind,
 };
 use color_eyre::eyre::{Context, Result, eyre};
 use std::cmp::Reverse;
@@ -452,6 +452,7 @@ struct ScannedProcess {
     ppid: Option<Pid>,
     name: String,
     command: String,
+    cwd: Option<ProcessCwd>,
     username: String,
     state: String,
     threads: u32,
@@ -515,6 +516,7 @@ fn scan_process_shell(
 
     let status = parse_status(&status_text);
     let command = read_cmdline(&root).unwrap_or_else(|| status.name.clone());
+    let cwd = read_cwd(&root);
     let username = lookup_username(status.uid, usernames);
     let fallback_rollup = MemoryRollup {
         rss: status.vm_rss,
@@ -536,6 +538,7 @@ fn scan_process_shell(
         ppid: status.ppid,
         name: status.name,
         command,
+        cwd,
         username,
         state: status.state,
         threads: status.threads,
@@ -675,6 +678,10 @@ fn read_cmdline(root: &Path) -> Option<String> {
     } else {
         Some(parts.join(" "))
     }
+}
+
+fn read_cwd(root: &Path) -> Option<ProcessCwd> {
+    fs::read_link(root.join("cwd")).ok().map(ProcessCwd::new)
 }
 
 fn lookup_username(uid: u32, cache: &mut BTreeMap<u32, String>) -> String {
@@ -947,6 +954,7 @@ fn build_process_tree(processes: Vec<ScannedProcess>, stats: ProcessTreeStats) -
             ppid: process.ppid,
             name: process.name,
             command: process.command,
+            cwd: process.cwd,
             username: process.username,
             state: process.state,
             threads: process.threads,
@@ -1354,6 +1362,7 @@ mod tests {
             ppid: None,
             name: format!("p{pid}"),
             command: format!("p{pid} --serve"),
+            cwd: None,
             username: "test".to_string(),
             state: "S".to_string(),
             threads: 1,

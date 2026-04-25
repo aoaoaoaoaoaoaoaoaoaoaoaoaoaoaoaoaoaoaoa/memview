@@ -313,6 +313,10 @@ fn push_process_search_tree(
 fn process_matches(search: &Search, node: &ProcessNode) -> bool {
     search.matches(&node.name)
         || search.matches(&node.command)
+        || node
+            .cwd
+            .as_ref()
+            .is_some_and(|cwd| search.matches(cwd.as_str()))
         || search.matches(&node.username)
         || search.matches(&node.state)
         || search.matches(&node.pid.to_string())

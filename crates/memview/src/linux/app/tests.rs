@@ -1,3 +1,4 @@
+use super::super::model::{MemoryRollup, ProcessCwd, ProcessTree, ProcessTreeStats};
 use super::*;
 
 #[derive(Clone, Debug)]
@@ -60,11 +61,53 @@ fn tmpfs_snapshot(mounts: Vec<TmpfsMount>) -> Snapshot {
         elapsed: Duration::ZERO,
         meminfo: Meminfo::default(),
         overview: super::super::model::Overview::default(),
-        process_tree: super::super::model::ProcessTree::default(),
+        process_tree: ProcessTree::default(),
         shared_objects: Vec::new(),
         sysv_segments: Vec::new(),
         tmpfs_mounts: mounts,
         warnings: Vec::new(),
+    }
+}
+
+fn process_snapshot(nodes: Vec<ProcessNode>) -> Snapshot {
+    Snapshot {
+        captured_at: SystemTime::UNIX_EPOCH,
+        elapsed: Duration::ZERO,
+        meminfo: Meminfo::default(),
+        overview: super::super::model::Overview::default(),
+        process_tree: ProcessTree {
+            roots: (0..nodes.len()).collect(),
+            nodes,
+            stats: ProcessTreeStats::default(),
+        },
+        shared_objects: Vec::new(),
+        sysv_segments: Vec::new(),
+        tmpfs_mounts: Vec::new(),
+        warnings: Vec::new(),
+    }
+}
+
+fn process_node(pid: i32, command: &str, cwd: Option<&str>) -> ProcessNode {
+    let rollup = MemoryRollup {
+        pss: Bytes(1024),
+        rss: Bytes(1024),
+        ..MemoryRollup::default()
+    };
+    ProcessNode {
+        pid: Pid(pid),
+        ppid: None,
+        name: format!("p{pid}"),
+        command: command.to_string(),
+        cwd: cwd.map(|path| ProcessCwd::new(PathBuf::from(path))),
+        username: "test".to_string(),
+        state: "S".to_string(),
+        threads: 1,
+        rollup,
+        subtree: rollup,
+        children: Vec::new(),
+        objects: Vec::new(),
+        rollup_state: LedgerState::Exact,
+        mappings_state: LedgerState::Deferred,
     }
 }
 
@@ -131,6 +174,22 @@ fn fold_policy_respects_roots_leaves_and_manual_overrides() {
     assert_eq!(policy.row_fold(&1, 1, false, Bytes(1)), RowFold::Leaf);
     assert_eq!(policy.row_fold(&1, 1, true, Bytes(99)), RowFold::Collapsed);
     assert_eq!(policy.row_fold(&7, 1, true, Bytes(99)), RowFold::Expanded);
+}
+
+#[test]
+fn process_search_matches_cwd() {
+    let mut app = App::new();
+    app.snapshot = Some(process_snapshot(vec![process_node(
+        42,
+        "rust-analyzer",
+        Some("/home/main/programming/projects/memview"),
+    )]));
+    app.search = Some(regex("memview"));
+
+    app.rebuild_process_rows();
+
+    assert_eq!(app.process_rows().len(), 1);
+    assert_eq!(app.process_rows()[0].pid, Pid(42));
 }
 
 #[test]
