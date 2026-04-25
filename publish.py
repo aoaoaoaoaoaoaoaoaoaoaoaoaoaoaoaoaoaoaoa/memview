@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 import tomllib
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 WORKSPACE_MANIFEST = ROOT / "Cargo.toml"
 REGISTRY_TOKEN = Path("/home/main/security/main.token")
+CRATES_IO_API = "https://crates.io/api/v1/crates/memview"
 
 
 @dataclass(frozen=True, order=True, slots=True)
@@ -101,6 +105,19 @@ def rev_parse(rev: str) -> str | None:
         return None
 
 
+def crate_version_published(version: Version) -> bool:
+    request = urllib.request.Request(
+        CRATES_IO_API,
+        headers={"User-Agent": "memview-publish/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.load(response)
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
+        raise SystemExit(f"[publish] could not query crates.io: {error}") from error
+    return any(entry.get("num") == str(version) for entry in payload.get("versions", []))
+
+
 def prepare_version() -> Version | None:
     version = current_version()
     tags = release_tags()
@@ -117,8 +134,17 @@ def prepare_version() -> Version | None:
         print(f"[publish] manual version bump detected: {version}", flush=True)
         return version
     if latest_commit == head:
-        print(f"[publish] HEAD is already {latest.tag()}; skipping crates.io publish", flush=True)
-        return None
+        if crate_version_published(version):
+            print(
+                f"[publish] HEAD is already {latest.tag()} and crates.io has {version}; skipping crates.io publish",
+                flush=True,
+            )
+            return None
+        print(
+            f"[publish] HEAD is already {latest.tag()} but crates.io lacks {version}; publishing",
+            flush=True,
+        )
+        return version
 
     bumped = version.next_patch()
     print(f"[publish] autobumping {version} -> {bumped}", flush=True)
