@@ -1,34 +1,52 @@
-#[cfg(not(target_os = "linux"))]
-compile_error!("memview is Linux-only: it reads Linux /proc, tmpfs, SysV shm, and pidfd surfaces.");
-
+#[cfg(target_os = "linux")]
 mod app;
+#[cfg(target_os = "linux")]
 mod model;
+#[cfg(target_os = "linux")]
 mod nav;
+#[cfg(target_os = "linux")]
 mod probe;
+#[cfg(target_os = "linux")]
 mod search;
+#[cfg(target_os = "linux")]
 mod ui;
 
+#[cfg(target_os = "linux")]
 use crate::app::{App, WorkerCommand, spawn_worker};
+#[cfg(target_os = "linux")]
 use clap::Parser;
+#[cfg(target_os = "linux")]
 use color_eyre::eyre::Result;
+#[cfg(target_os = "linux")]
 use crossterm::cursor::{Hide, Show};
+#[cfg(target_os = "linux")]
 use crossterm::event::{
     self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
     KeyEventKind,
 };
+#[cfg(target_os = "linux")]
 use crossterm::execute;
+#[cfg(target_os = "linux")]
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+#[cfg(target_os = "linux")]
 use ratatui::Terminal;
+#[cfg(target_os = "linux")]
 use ratatui::backend::CrosstermBackend;
+#[cfg(target_os = "linux")]
 use std::io::{self, Stdout};
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 const FOCUSED_IDLE_POLL: Duration = Duration::from_millis(500);
+#[cfg(target_os = "linux")]
 const BACKGROUND_IDLE_POLL: Duration = Duration::from_secs(1);
+#[cfg(target_os = "linux")]
 const ANIMATED_REDRAW: Duration = Duration::from_millis(250);
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Parser)]
 #[command(author, version, about = "ncdu-like RAM accounting for Linux /proc")]
 struct Cli {
@@ -36,6 +54,7 @@ struct Cli {
     refresh_ms: u64,
 }
 
+#[cfg(target_os = "linux")]
 fn main() -> Result<()> {
     color_eyre::install()?;
     let cli = Cli::parse();
@@ -101,6 +120,13 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("memview is not supported on this system: Linux is required.");
+    std::process::exit(1);
+}
+
+#[cfg(target_os = "linux")]
 fn poll_timeout(app: &App, next_animated_redraw: Instant) -> Duration {
     if !app.is_focused() {
         return BACKGROUND_IDLE_POLL;
@@ -112,10 +138,12 @@ fn poll_timeout(app: &App, next_animated_redraw: Instant) -> Duration {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
 
+#[cfg(target_os = "linux")]
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;

@@ -10,7 +10,7 @@ repository = "https://git.swarm.moe/memview.git"
 rust-version.workspace = true
 version.workspace = true
 
-[dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 color-eyre = "0.6.5"
 crossterm = "0.29.0"
