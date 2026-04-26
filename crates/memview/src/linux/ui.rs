@@ -14,6 +14,40 @@ const MUTED: Color = Color::Rgb(129, 145, 160);
 const ACCENT: Color = Color::Rgb(64, 184, 173);
 const HOT: Color = Color::Rgb(227, 116, 94);
 const GOLD: Color = Color::Rgb(236, 180, 71);
+const FOOTER_KEY: Color = Color::Rgb(211, 218, 226);
+
+macro_rules! hotkeys {
+    ($(($key:literal, $action:literal)),+ $(,)?) => {
+        &[$(Hotkey { key: $key, action: $action }),+]
+    };
+}
+
+const FOOTER_GLOBAL: &[Hotkey] = hotkeys![("q", "quit"), ("/", "search"), ("?", "help")];
+const FOOTER_OVERVIEW: &[Hotkey] = hotkeys![("r", "refresh overview"), ("s", "lens")];
+const FOOTER_PROCESSES: &[Hotkey] = hotkeys![
+    ("j/k/Pg/wheel", "move"),
+    ("gg/G", "edge"),
+    ("Enter", "fold"),
+    ("s", "sort"),
+    ("m", "mode"),
+    ("K", "SIGTERM"),
+    ("r", "rescan"),
+];
+const FOOTER_TMPFS: &[Hotkey] = hotkeys![
+    ("j/k/Pg/wheel", "move"),
+    ("gg/G", "edge"),
+    ("Enter", "fold"),
+    ("m", "mode"),
+    ("d", "delete"),
+    ("r", "refresh mount"),
+];
+const FOOTER_SHARED: &[Hotkey] = hotkeys![
+    ("j/k/Pg/wheel", "move"),
+    ("gg/G", "edge"),
+    ("s", "sort"),
+    ("m", "mode"),
+    ("r", "rescan"),
+];
 
 pub fn render(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
@@ -98,18 +132,18 @@ fn footer(app: &App) -> Paragraph<'static> {
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            "f clear",
-            Style::default().fg(HOT).add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw("  "));
+        push_footer_hotkey(
+            &mut spans,
+            &Hotkey {
+                key: "f",
+                action: "clear",
+            },
+        );
     }
+    push_footer_hotkeys(&mut spans, FOOTER_GLOBAL);
+    push_footer_hotkeys(&mut spans, pane_footer(app));
     spans.push(Span::styled(
-        format!(
-            "q quit  / search  ? help  {}  {}",
-            pane_footer(app),
-            app.current_time_label()
-        ),
+        app.current_time_label(),
         Style::default().fg(MUTED),
     ));
     if let Some(error) = &app.last_error {
@@ -161,16 +195,25 @@ fn footer(app: &App) -> Paragraph<'static> {
     Paragraph::new(Line::from(spans)).style(Style::default().bg(BG))
 }
 
-fn pane_footer(app: &App) -> &'static str {
+fn push_footer_hotkeys(spans: &mut Vec<Span<'static>>, hotkeys: &[Hotkey]) {
+    for hotkey in hotkeys {
+        push_footer_hotkey(spans, hotkey);
+    }
+}
+
+fn push_footer_hotkey(spans: &mut Vec<Span<'static>>, hotkey: &Hotkey) {
+    spans.push(Span::styled(hotkey.key, Style::default().fg(FOOTER_KEY)));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(hotkey.action, Style::default().fg(MUTED)));
+    spans.push(Span::raw("  "));
+}
+
+fn pane_footer(app: &App) -> &'static [Hotkey] {
     match app.tab {
-        super::app::Tab::Overview => "r refresh overview  s lens",
-        super::app::Tab::Processes => {
-            "j/k/Pg/wheel move  gg/G edge  Enter fold  s sort  m mode  K SIGTERM  r rescan"
-        }
-        super::app::Tab::Tmpfs => {
-            "j/k/Pg/wheel move  gg/G edge  Enter fold  m mode  d delete  r refresh mount"
-        }
-        super::app::Tab::Shared => "j/k/Pg/wheel move  gg/G edge  s sort  m mode  r rescan",
+        super::app::Tab::Overview => FOOTER_OVERVIEW,
+        super::app::Tab::Processes => FOOTER_PROCESSES,
+        super::app::Tab::Tmpfs => FOOTER_TMPFS,
+        super::app::Tab::Shared => FOOTER_SHARED,
     }
 }
 
