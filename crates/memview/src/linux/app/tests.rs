@@ -170,7 +170,7 @@ fn de_minimis_chooses_lower_threshold() {
 fn process_scanning_tracks_focus_and_active_tab() {
     let (commands, events) = mpsc::channel();
     let commands = WorkerPort::process_harness(commands);
-    let mut app = App::new();
+    let mut app = App::new(UiState::default());
 
     app.set_focused(false, &commands);
     assert!(!next_process_scan_switch(&events));
@@ -207,7 +207,7 @@ fn fold_policy_respects_roots_leaves_and_manual_overrides() {
 
 #[test]
 fn process_search_matches_cwd() {
-    let mut app = App::new();
+    let mut app = App::new(UiState::default());
     app.ledgers.processes = Some(process_ledger(vec![process_node(
         42,
         "rust-analyzer",
@@ -239,7 +239,7 @@ fn pane_rows_can_select_deleted_row_successor_slot() {
 
 #[test]
 fn tmpfs_background_rebuilds_stay_pinned_to_top_until_user_entry() {
-    let mut app = App::new();
+    let mut app = App::new(UiState::default());
     app.ledgers.tmpfs = Some(tmpfs_ledger(vec![tmpfs_mount("/tmpfs-small", Bytes(1))]));
     app.rebuild_tmpfs_rows();
     assert_eq!(
@@ -263,7 +263,7 @@ fn tmpfs_background_rebuilds_stay_pinned_to_top_until_user_entry() {
 fn first_tmpfs_entry_seizes_top_then_preserves_user_anchor() {
     let (processes, _requests) = mpsc::channel();
     let commands = WorkerPort::process_harness(processes);
-    let mut app = App::new();
+    let mut app = App::new(UiState::default());
     app.ledgers.tmpfs = Some(tmpfs_ledger(vec![
         tmpfs_mount("/tmpfs-big", Bytes(2)),
         tmpfs_mount("/tmpfs-small", Bytes(1)),
@@ -288,7 +288,7 @@ fn first_tmpfs_entry_seizes_top_then_preserves_user_anchor() {
 
 #[test]
 fn optimistic_tmpfs_delete_prunes_immediately_and_keeps_successor_slot() {
-    let mut app = App::new();
+    let mut app = App::new(UiState::default());
     app.tab = Tab::Tmpfs;
     app.ledgers.tmpfs = Some(tmpfs_ledger(vec![tmpfs_tree(
         "/proc/self/memview-delete-test",
@@ -341,7 +341,7 @@ fn confirmed_tmpfs_tombstone_prunes_stale_scan_and_clears_after_absent_scan() {
         )],
     );
     let victim = PathBuf::from("/tmp/memview-tombstone-test/victim");
-    let mut app = App::new();
+    let mut app = App::new(UiState::default());
     app.ledgers.tmpfs = Some(tmpfs_ledger(vec![stale.clone()]));
     let _ = app
         .deletions
@@ -362,7 +362,7 @@ fn deletion_receiver_transitions_are_total() {
     let mount_point = PathBuf::from("/tmp");
 
     let deleted = PathBuf::from("/tmp/deleted");
-    let mut app = App::new();
+    let mut app = App::new(UiState::default());
     let _ = app_deletion(&mut app, deleted.clone(), mount_point.clone(), {
         let (sender, result) = mpsc::channel();
         sender.send(DeleteOutcome::Deleted).expect("receiver lives");
@@ -404,7 +404,7 @@ fn app_deletion(
 
 #[test]
 fn tmpfs_search_self_mode_filters_to_direct_matches_and_sums_them() {
-    let mut app = App::new();
+    let mut app = App::new(UiState::default());
     app.ledgers.tmpfs = Some(tmpfs_ledger(vec![tmpfs_tree(
         "/mnt",
         Bytes(35),
@@ -430,7 +430,7 @@ fn tmpfs_search_self_mode_filters_to_direct_matches_and_sums_them() {
 
 #[test]
 fn tmpfs_search_self_and_children_includes_context_parents_without_counting_them() {
-    let mut app = App::new();
+    let mut app = App::new(UiState::default());
     app.tree_scope = TreeScope::SelfAndChildren;
     app.ledgers.tmpfs = Some(tmpfs_ledger(vec![tmpfs_tree(
         "/mnt",
@@ -461,7 +461,7 @@ fn tmpfs_search_self_and_children_includes_context_parents_without_counting_them
 
 #[test]
 fn tmpfs_search_self_and_children_does_not_double_count_nested_matches() {
-    let mut app = App::new();
+    let mut app = App::new(UiState::default());
     app.tree_scope = TreeScope::SelfAndChildren;
     app.ledgers.tmpfs = Some(tmpfs_ledger(vec![tmpfs_tree(
         "/batch-root",
@@ -486,7 +486,7 @@ fn page_rows_match_left_table_viewport_height() {
 fn page_keys_move_one_visible_pane() {
     let (processes, _requests) = mpsc::channel();
     let commands = WorkerPort::process_harness(processes);
-    let mut app = App::new();
+    let mut app = App::new(UiState::default());
     app.tab = Tab::Tmpfs;
     app.set_terminal_height(12);
     app.tmpfs_rows.install(

@@ -3,6 +3,7 @@ mod model;
 mod nav;
 mod probe;
 mod search;
+mod state;
 mod ui;
 
 use app::{App, spawn_worker};
@@ -19,6 +20,7 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use state::UiStateStore;
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
@@ -39,8 +41,13 @@ pub fn run() -> MainResult {
     color_eyre::install()?;
     let cli = Cli::parse();
     let (commands, events) = spawn_worker(Duration::from_millis(cli.refresh_ms));
+    let mut state_store = UiStateStore::discover();
     let mut terminal = TerminalGuard::enter()?;
-    let mut app = App::new();
+    let mut app = App::new(state_store.restored());
+    app.last_error = state_store.take_warning();
+    if let Some(warning) = state_store.sync(app.ui_state()) {
+        app.last_error = Some(warning);
+    }
     app.set_terminal_height(terminal.height()?);
     app.start_visible_work(&commands);
     let mut dirty = true;
@@ -69,7 +76,11 @@ pub fn run() -> MainResult {
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
-                    if app.handle_key(key, &commands) {
+                    let quit = app.handle_key(key, &commands);
+                    if let Some(warning) = state_store.sync(app.ui_state()) {
+                        app.last_error = Some(warning);
+                    }
+                    if quit {
                         break;
                     }
                     dirty = true;

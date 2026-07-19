@@ -37,6 +37,23 @@ pub enum TreeScope {
     SelfAndChildren,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UiState {
+    pub tab: Tab,
+    pub metric: Metric,
+    pub tree_scope: TreeScope,
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            tab: Tab::Processes,
+            metric: Metric::Pss,
+            tree_scope: TreeScope::SelfOnly,
+        }
+    }
+}
+
 impl TreeScope {
     #[must_use]
     pub fn next(self) -> Self {
@@ -581,20 +598,20 @@ impl TryFrom<TmpfsNodeKind> for DeleteKind {
 
 impl App {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(state: UiState) -> Self {
         Self {
-            tab: Tab::Processes,
-            metric: Metric::Pss,
-            tree_scope: TreeScope::SelfOnly,
+            tab: state.tab,
+            metric: state.metric,
+            tree_scope: state.tree_scope,
             focused: true,
             modal: None,
             ledgers: Ledgers::default(),
             last_error: None,
             process_scan_started_at: None,
             search: None,
-            process_search: SearchSummary::new(Metric::Pss.label()),
+            process_search: SearchSummary::new(state.metric.label()),
             tmpfs_search: SearchSummary::new("allocated"),
-            shared_search: SearchSummary::new(Metric::Pss.label()),
+            shared_search: SearchSummary::new(state.metric.label()),
             process_folds: BTreeMap::new(),
             tmpfs_folds: BTreeMap::new(),
             process_mappings: MappingLedgers::default(),
@@ -606,6 +623,15 @@ impl App {
             shared_rows: PaneRows::default(),
             page_rows: PageRows::default(),
             key_sequence: KeySequence::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn ui_state(&self) -> UiState {
+        UiState {
+            tab: self.tab,
+            metric: self.metric,
+            tree_scope: self.tree_scope,
         }
     }
 
