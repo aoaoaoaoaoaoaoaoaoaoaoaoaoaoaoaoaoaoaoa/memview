@@ -1,5 +1,8 @@
-use super::app::{App, FlatProcessRow, FlatSharedRow, FlatTmpfsRow, Hotkey, RowFold};
-use super::model::{Bytes, Meminfo, MeminfoEntry, ObjectUsage, Pid, Snapshot, TmpfsMount};
+use super::app::{App, Binding, FlatProcessRow, FlatSharedRow, FlatTmpfsRow, RowFold};
+use super::model::{
+    Bytes, Meminfo, MeminfoEntry, ObjectUsage, Pid, ProcessTotals, Processes, Shared, TmpfsMount,
+};
+use super::nav::FooterHint;
 use super::search::SearchRole;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -16,39 +19,6 @@ const HOT: Color = Color::Rgb(227, 116, 94);
 const GOLD: Color = Color::Rgb(236, 180, 71);
 const FOOTER_KEY: Color = Color::Rgb(211, 218, 226);
 
-macro_rules! hotkeys {
-    ($(($key:literal, $action:literal)),+ $(,)?) => {
-        &[$(Hotkey { key: $key, action: $action }),+]
-    };
-}
-
-const FOOTER_GLOBAL: &[Hotkey] = hotkeys![("q", "quit"), ("/", "search"), ("?", "help")];
-const FOOTER_OVERVIEW: &[Hotkey] = hotkeys![("r", "refresh overview"), ("s", "lens")];
-const FOOTER_PROCESSES: &[Hotkey] = hotkeys![
-    ("j/k/Pg/wheel", "move"),
-    ("gg/G", "edge"),
-    ("Enter", "fold"),
-    ("s", "sort"),
-    ("m", "mode"),
-    ("K", "SIGTERM"),
-    ("r", "rescan"),
-];
-const FOOTER_TMPFS: &[Hotkey] = hotkeys![
-    ("j/k/Pg/wheel", "move"),
-    ("gg/G", "edge"),
-    ("Enter", "fold"),
-    ("m", "mode"),
-    ("d", "delete"),
-    ("r", "refresh mount"),
-];
-const FOOTER_SHARED: &[Hotkey] = hotkeys![
-    ("j/k/Pg/wheel", "move"),
-    ("gg/G", "edge"),
-    ("s", "sort"),
-    ("m", "mode"),
-    ("r", "rescan"),
-];
-
 pub fn render(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
     let chunks = Layout::default()
@@ -61,16 +31,17 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         .split(area);
 
     frame.render_widget(header(app), chunks[0]);
-    match app.snapshot.as_ref() {
-        Some(snapshot) => render_body(frame, app, snapshot, chunks[1]),
-        None => render_loading(frame, app, chunks[1]),
+    if app.active_ledger_ready() {
+        render_body(frame, app, chunks[1]);
+    } else {
+        render_loading(frame, app, chunks[1]);
     }
     frame.render_widget(footer(app), chunks[2]);
 
-    if app.show_help {
+    if app.help_open() {
         render_help(frame, app, area);
     }
-    if app.kill_confirmation.is_some() {
+    if app.kill_confirmation().is_some() {
         render_kill_confirmation(frame, app, area);
     }
     if app.search_draft().is_some() {
@@ -78,12 +49,12 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     }
 }
 
-fn render_body(frame: &mut Frame<'_>, app: &App, snapshot: &Snapshot, area: Rect) {
+fn render_body(frame: &mut Frame<'_>, app: &App, area: Rect) {
     match app.tab {
-        super::app::Tab::Overview => render_overview(frame, app, snapshot, area),
-        super::app::Tab::Processes => render_processes(frame, app, snapshot, area),
-        super::app::Tab::Tmpfs => render_tmpfs(frame, app, snapshot, area),
-        super::app::Tab::Shared => render_shared(frame, app, snapshot, area),
+        super::app::Tab::Overview => render_overview(frame, app, area),
+        super::app::Tab::Processes => render_processes(frame, app, area),
+        super::app::Tab::Tmpfs => render_tmpfs(frame, app, area),
+        super::app::Tab::Shared => render_shared(frame, app, area),
     }
 }
 
@@ -110,11 +81,13 @@ fn header(app: &App) -> Paragraph<'static> {
         format!("sort {}", app.metric.label()),
         Style::default().fg(GOLD),
     ));
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
-        format!("mode {}", app.process_scope.label()),
-        Style::default().fg(ACCENT),
-    ));
+    if matches!(app.tab, super::app::Tab::Processes | super::app::Tab::Tmpfs) {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("mode {}", app.tree_scope.label()),
+            Style::default().fg(ACCENT),
+        ));
+    }
 
     Paragraph::new(Line::from(spans))
         .block(panel("Memory Ledger"))
@@ -132,16 +105,17 @@ fn footer(app: &App) -> Paragraph<'static> {
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
-        push_footer_hotkey(
-            &mut spans,
-            &Hotkey {
-                key: "f",
-                action: "clear",
-            },
-        );
     }
-    push_footer_hotkeys(&mut spans, FOOTER_GLOBAL);
-    push_footer_hotkeys(&mut spans, pane_footer(app));
+    let bindings = app.binding_sections();
+    for hint in bindings
+        .global
+        .iter()
+        .chain(bindings.navigation)
+        .chain(bindings.pane)
+        .filter_map(|binding| binding.footer)
+    {
+        push_footer_hint(&mut spans, hint);
+    }
     spans.push(Span::styled(
         app.current_time_label(),
         Style::default().fg(MUTED),
@@ -156,7 +130,7 @@ fn footer(app: &App) -> Paragraph<'static> {
             Style::default().fg(HOT),
         ));
     }
-    if let Some(confirmation) = &app.kill_confirmation {
+    if let Some(confirmation) = app.kill_confirmation() {
         if confirmation.armed() {
             spans.push(Span::styled(
                 "  SIGTERM armed: y confirms",
@@ -195,26 +169,11 @@ fn footer(app: &App) -> Paragraph<'static> {
     Paragraph::new(Line::from(spans)).style(Style::default().bg(BG))
 }
 
-fn push_footer_hotkeys(spans: &mut Vec<Span<'static>>, hotkeys: &[Hotkey]) {
-    for hotkey in hotkeys {
-        push_footer_hotkey(spans, hotkey);
-    }
-}
-
-fn push_footer_hotkey(spans: &mut Vec<Span<'static>>, hotkey: &Hotkey) {
-    spans.push(Span::styled(hotkey.key, Style::default().fg(FOOTER_KEY)));
+fn push_footer_hint(spans: &mut Vec<Span<'static>>, hint: FooterHint) {
+    spans.push(Span::styled(hint.key, Style::default().fg(FOOTER_KEY)));
     spans.push(Span::raw(" "));
-    spans.push(Span::styled(hotkey.action, Style::default().fg(MUTED)));
+    spans.push(Span::styled(hint.action, Style::default().fg(MUTED)));
     spans.push(Span::raw("  "));
-}
-
-fn pane_footer(app: &App) -> &'static [Hotkey] {
-    match app.tab {
-        super::app::Tab::Overview => FOOTER_OVERVIEW,
-        super::app::Tab::Processes => FOOTER_PROCESSES,
-        super::app::Tab::Tmpfs => FOOTER_TMPFS,
-        super::app::Tab::Shared => FOOTER_SHARED,
-    }
 }
 
 fn render_loading(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -232,7 +191,11 @@ fn render_loading(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-fn render_overview(frame: &mut Frame<'_>, _app: &App, snapshot: &Snapshot, area: Rect) {
+fn render_overview(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(meminfo) = app.meminfo() else {
+        render_loading(frame, app, area);
+        return;
+    };
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
@@ -242,11 +205,10 @@ fn render_overview(frame: &mut Frame<'_>, _app: &App, snapshot: &Snapshot, area:
         .constraints([Constraint::Length(11), Constraint::Min(8)])
         .split(columns[1]);
 
-    let mem_rows = snapshot
-        .meminfo
+    let mem_rows = meminfo
         .entries
         .iter()
-        .map(|entry| row_meminfo(entry, &snapshot.meminfo))
+        .map(|entry| row_meminfo(entry, meminfo))
         .collect::<Vec<_>>();
     frame.render_widget(
         Table::new(
@@ -263,39 +225,39 @@ fn render_overview(frame: &mut Frame<'_>, _app: &App, snapshot: &Snapshot, area:
         columns[0],
     );
 
+    let process_totals = app
+        .processes()
+        .map_or_else(ProcessTotals::default, |processes| processes.totals.clone());
+    let tmpfs_allocated = app
+        .tmpfs()
+        .map_or(Bytes::ZERO, |tmpfs| tmpfs.allocated_total);
+    let sysv_rss = app
+        .inventory()
+        .map_or(Bytes::ZERO, |inventory| inventory.sysv_rss_total);
+    let sysv_segments = app
+        .inventory()
+        .map_or(0, |inventory| inventory.sysv_segments.len());
     let overview_rows = vec![
-        summary_row("Σ process PSS", snapshot.overview.process_pss_total),
-        summary_row("Σ process USS", snapshot.overview.process_uss_total),
-        summary_row("Σ process RSS", snapshot.overview.process_rss_total),
-        summary_row(
-            "Σ process SwapPSS",
-            snapshot.overview.process_swap_pss_total,
-        ),
-        summary_row(
-            "Σ process PSS anon",
-            snapshot.overview.process_pss_anon_total,
-        ),
-        summary_row(
-            "Σ process PSS file",
-            snapshot.overview.process_pss_file_total,
-        ),
-        summary_row(
-            "Σ process PSS shmem",
-            snapshot.overview.process_pss_shmem_total,
-        ),
-        summary_row("Σ tmpfs allocated", snapshot.overview.tmpfs_allocated_total),
-        summary_row("Σ SysV shm RSS", snapshot.overview.sysv_rss_total),
-        summary_text_row("processes", &snapshot.overview.process_count.to_string()),
-        summary_text_row("SysV segments", &snapshot.sysv_segments.len().to_string()),
-        summary_text_row("scan millis", &snapshot.elapsed.as_millis().to_string()),
+        summary_row("Σ process PSS", process_totals.pss),
+        summary_row("Σ process USS", process_totals.uss),
+        summary_row("Σ process RSS", process_totals.rss),
+        summary_row("Σ process SwapPSS", process_totals.swap_pss),
+        summary_row("Σ process PSS anon", process_totals.pss_anon),
+        summary_row("Σ process PSS file", process_totals.pss_file),
+        summary_row("Σ process PSS shmem", process_totals.pss_shmem),
+        summary_row("Σ tmpfs allocated", tmpfs_allocated),
+        summary_row("Σ SysV shm RSS", sysv_rss),
+        summary_text_row("processes", &process_totals.process_count.to_string()),
+        summary_text_row("SysV segments", &sysv_segments.to_string()),
         summary_text_row(
-            "inaccessible rollups",
-            &snapshot.overview.inaccessible_rollups.to_string(),
+            "scan millis",
+            &app.last_capture_elapsed().as_millis().to_string(),
         ),
         summary_text_row(
-            "inaccessible maps",
-            &snapshot.overview.inaccessible_maps.to_string(),
+            "degraded rollups",
+            &process_totals.degraded_rollups.to_string(),
         ),
+        summary_text_row("degraded maps", &process_totals.degraded_maps.to_string()),
     ];
     frame.render_widget(
         Table::new(
@@ -308,17 +270,22 @@ fn render_overview(frame: &mut Frame<'_>, _app: &App, snapshot: &Snapshot, area:
         right[0],
     );
 
-    let warning_lines = if snapshot.warnings.is_empty() {
+    let warnings = app.warnings();
+    let warning_lines = if warnings.is_empty() {
         vec![Line::from(Span::styled(
             "No probe warnings. PSS is the attribution lens; tmpfs uses allocated blocks.",
             Style::default().fg(FG),
         ))]
     } else {
-        snapshot
-            .warnings
+        warnings
             .iter()
             .take(24)
-            .map(|warning| Line::from(Span::styled(warning.clone(), Style::default().fg(HOT))))
+            .map(|warning| {
+                Line::from(Span::styled(
+                    (*warning).to_string(),
+                    Style::default().fg(HOT),
+                ))
+            })
             .collect::<Vec<_>>()
     };
     frame.render_widget(
@@ -330,8 +297,12 @@ fn render_overview(frame: &mut Frame<'_>, _app: &App, snapshot: &Snapshot, area:
     );
 }
 
-fn render_processes(frame: &mut Frame<'_>, app: &App, snapshot: &Snapshot, area: Rect) {
-    let capacity = snapshot.meminfo.get("MemTotal");
+fn render_processes(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(processes) = app.processes() else {
+        render_loading(frame, app, area);
+        return;
+    };
+    let capacity = processes.meminfo.get("MemTotal");
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(57), Constraint::Percentage(43)])
@@ -341,7 +312,7 @@ fn render_processes(frame: &mut Frame<'_>, app: &App, snapshot: &Snapshot, area:
         .constraints([Constraint::Length(16), Constraint::Min(8)])
         .split(columns[1]);
 
-    if snapshot.process_tree.nodes.is_empty() && app.process_scan_started_at.is_some() {
+    if processes.tree.nodes.is_empty() && app.process_scan_started_at.is_some() {
         frame.render_widget(
             Paragraph::new("Capturing process memory snapshot...")
                 .block(panel("process tree"))
@@ -367,7 +338,7 @@ fn render_processes(frame: &mut Frame<'_>, app: &App, snapshot: &Snapshot, area:
         .map(|(offset, row)| {
             row_process(
                 app,
-                snapshot,
+                processes,
                 row,
                 visible.start + offset == selected,
                 capacity,
@@ -390,10 +361,7 @@ fn render_processes(frame: &mut Frame<'_>, app: &App, snapshot: &Snapshot, area:
         .header(header_row([
             "Task", "PID", "User", "PSS", "USS", "RSS", "Command",
         ]))
-        .block(panel(&format!(
-            "process tree ({})",
-            app.process_scope.label()
-        )))
+        .block(panel(&format!("process tree ({})", app.tree_scope.label())))
         .column_spacing(1),
         columns[0],
     );
@@ -494,11 +462,10 @@ fn mapping_loading(pid: Pid, elapsed: Duration) -> Paragraph<'static> {
     .style(Style::default().fg(FG))
 }
 
-fn render_tmpfs(frame: &mut Frame<'_>, app: &App, _snapshot: &Snapshot, area: Rect) {
+fn render_tmpfs(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let capacity = app
-        .snapshot
-        .as_ref()
-        .map_or(Bytes::ZERO, |snapshot| snapshot.meminfo.get("MemTotal"));
+        .meminfo()
+        .map_or(Bytes::ZERO, |meminfo| meminfo.get("MemTotal"));
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
@@ -550,8 +517,12 @@ fn render_tmpfs(frame: &mut Frame<'_>, app: &App, _snapshot: &Snapshot, area: Re
     );
 }
 
-fn render_shared(frame: &mut Frame<'_>, app: &App, snapshot: &Snapshot, area: Rect) {
-    let capacity = snapshot.meminfo.get("MemTotal");
+fn render_shared(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(shared) = app.shared() else {
+        render_loading(frame, app, area);
+        return;
+    };
+    let capacity = shared.meminfo.get("MemTotal");
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
@@ -563,7 +534,13 @@ fn render_shared(frame: &mut Frame<'_>, app: &App, snapshot: &Snapshot, area: Re
         .iter()
         .enumerate()
         .map(|(offset, row)| {
-            row_shared(snapshot, row, visible.start + offset == selected, capacity)
+            row_shared(
+                shared,
+                row,
+                visible.start + offset == selected,
+                capacity,
+                app.metric,
+            )
         })
         .collect::<Vec<_>>();
     frame.render_widget(
@@ -684,13 +661,13 @@ fn summary_text_row(label: &str, value: &str) -> Row<'static> {
 
 fn row_process(
     app: &App,
-    snapshot: &Snapshot,
+    processes: &Processes,
     row: &FlatProcessRow,
     selected: bool,
     capacity: Bytes,
 ) -> Row<'static> {
-    let node = &snapshot.process_tree.nodes[row.index];
-    let rollup = app.process_scope.rollup(node);
+    let node = &processes.tree.nodes[row.index];
+    let rollup = app.tree_scope.rollup(node);
     let marker = match row.fold {
         RowFold::Leaf => " ",
         RowFold::Collapsed => "▸",
@@ -737,12 +714,13 @@ fn row_tmpfs(row: &FlatTmpfsRow, selected: bool, capacity: Bytes) -> Row<'static
 }
 
 fn row_shared(
-    snapshot: &Snapshot,
+    shared: &Shared,
     row: &FlatSharedRow,
     selected: bool,
     capacity: Bytes,
+    metric: super::model::Metric,
 ) -> Row<'static> {
-    let object = &snapshot.shared_objects[row.index];
+    let object = &shared.objects[row.index];
     Row::new(vec![
         Cell::from(object.kind.label().to_string()),
         Cell::from(object.mapped_processes.to_string()),
@@ -753,7 +731,7 @@ fn row_shared(
     ])
     .style(usage_style_for_role(
         selected,
-        object.rollup.pss,
+        object.rollup.metric(metric),
         capacity,
         row.search,
     ))
@@ -797,7 +775,7 @@ fn search_summary_lines(app: &App, capacity: Bytes) -> Vec<Line<'static>> {
         return Vec::new();
     };
     let pattern = app.search_pattern().unwrap_or_default();
-    vec![
+    let mut lines = vec![
         Line::from(Span::styled(
             "regexp matches",
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
@@ -809,9 +787,12 @@ fn search_summary_lines(app: &App, capacity: Bytes) -> Vec<Line<'static>> {
             "pct total",
             &format!("{:.2}%", summary.total.pct_of(capacity)),
         ),
-        detail_line("mode", app.search_scope_label()),
-        Line::from(""),
-    ]
+    ];
+    if matches!(app.tab, super::app::Tab::Processes | super::app::Tab::Tmpfs) {
+        lines.push(detail_line("mode", app.search_scope_label()));
+    }
+    lines.push(Line::from(""));
+    lines
 }
 
 fn detail_line(label: &str, value: &str) -> Line<'static> {
@@ -941,7 +922,7 @@ fn panel(title: &str) -> Block<'static> {
 fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let popup = centered_rect(area, 82, 88);
     frame.render_widget(Clear, popup);
-    let hotkeys = app.hotkey_sections();
+    let bindings = app.binding_sections();
     let mut text = vec![
         Line::from(Span::styled(
             "memview keys",
@@ -950,12 +931,13 @@ fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Line::from(""),
         section_heading("Global"),
     ];
-    text.extend(hotkeys.global.iter().map(hotkey_line));
+    text.extend(bindings.global.iter().map(binding_line));
     text.extend([
         Line::from(""),
-        section_heading(&format!("Pane: {}", hotkeys.pane_title)),
+        section_heading(&format!("Pane: {}", bindings.pane_title)),
     ]);
-    text.extend(hotkeys.pane.iter().map(hotkey_line));
+    text.extend(bindings.navigation.iter().map(binding_line));
+    text.extend(bindings.pane.iter().map(binding_line));
     text.extend([
         Line::from(""),
         section_heading("Notes"),
@@ -985,12 +967,12 @@ fn section_heading(label: &str) -> Line<'static> {
     ))
 }
 
-fn hotkey_line(hotkey: &Hotkey) -> Line<'static> {
-    detail_line(hotkey.key, hotkey.action)
+fn binding_line(binding: &Binding) -> Line<'static> {
+    detail_line(binding.key, binding.description)
 }
 
 fn render_kill_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let Some(confirmation) = app.kill_confirmation.as_ref() else {
+    let Some(confirmation) = app.kill_confirmation() else {
         return;
     };
 
@@ -1150,12 +1132,12 @@ fn slice_window<T>(items: &[T], selected: usize, height: usize) -> SliceWindow<'
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
-
     fn meminfo(total: Bytes) -> Meminfo {
         Meminfo {
-            entries: Vec::new(),
-            table: BTreeMap::from([("MemTotal".to_string(), total)]),
+            entries: vec![MeminfoEntry {
+                key: "MemTotal".to_string(),
+                value: total,
+            }],
         }
     }
 

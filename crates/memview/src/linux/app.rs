@@ -1,8 +1,9 @@
 use super::model::{
-    Bytes, LedgerState, Meminfo, Metric, ObjectKind, ObjectUsage, Pid, ProcessNode, SharedObject,
-    Snapshot, TmpfsMount, TmpfsNode, TmpfsNodeKind,
+    Bytes, Inventory, Ledger, Meminfo, Metric, ObjectKind, ObjectUsage, Pid, ProcessKey,
+    ProcessNode, Processes, Shared, SharedObject, Tmpfs, TmpfsMount, TmpfsNode, TmpfsNodeKind,
 };
-pub use super::nav::{Hotkey, HotkeySections, Tab};
+use super::nav::{self, Action};
+pub use super::nav::{Binding, BindingSections, Tab};
 use super::probe;
 use super::search::{Search, SearchDraft, SearchRole, SearchSummary};
 use color_eyre::eyre::Result;
@@ -12,25 +13,31 @@ use rustix::process::{Pid as KernelPid, PidfdFlags, Signal, pidfd_open, pidfd_se
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+mod ledgers;
+mod mappings;
 mod rows;
 mod worker;
+use ledgers::Ledgers;
+use mappings::MappingLedgers;
 use rows::{build_process_rows, build_shared_rows, build_tmpfs_rows};
-pub use worker::{WorkerCommand, WorkerEvent, spawn_worker};
+#[cfg(test)]
+pub use worker::ProcessRequest;
+pub use worker::{WorkerEvent, WorkerPort, spawn_worker};
 
 const KILL_ARMING_DELAY: Duration = Duration::from_secs(2);
 const TERMINAL_FRAME_ROWS: u16 = 9;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProcessScope {
+pub enum TreeScope {
     SelfOnly,
     SelfAndChildren,
 }
 
-impl ProcessScope {
+impl TreeScope {
     #[must_use]
     pub fn next(self) -> Self {
         match self {
@@ -59,7 +66,7 @@ impl ProcessScope {
 #[derive(Clone, Debug)]
 pub struct FlatProcessRow {
     pub index: usize,
-    pub pid: Pid,
+    pub key: ProcessKey,
     pub depth: usize,
     pub fold: RowFold,
     pub search: SearchRole,
@@ -121,10 +128,10 @@ pub trait IdentifiedRow {
 }
 
 impl IdentifiedRow for FlatProcessRow {
-    type Key = Pid;
+    type Key = ProcessKey;
 
     fn key(&self) -> &Self::Key {
-        &self.pid
+        &self.key
     }
 }
 
@@ -147,7 +154,6 @@ impl IdentifiedRow for FlatSharedRow {
 #[derive(Clone, Debug)]
 pub struct PaneRows<Row: IdentifiedRow> {
     rows: Vec<Row>,
-    by_key: BTreeMap<Row::Key, RowIndex>,
     selected: Option<RowIndex>,
 }
 
@@ -155,7 +161,6 @@ impl<Row: IdentifiedRow> Default for PaneRows<Row> {
     fn default() -> Self {
         Self {
             rows: Vec::new(),
-            by_key: BTreeMap::new(),
             selected: None,
         }
     }
@@ -194,17 +199,12 @@ impl<Row: IdentifiedRow> PaneRows<Row> {
     }
 
     fn install_prefer(&mut self, rows: Vec<Row>, preferred: Option<Row::Key>) {
-        let by_key = rows
-            .iter()
-            .enumerate()
-            .map(|(index, row)| (row.key().clone(), RowIndex::new(index)))
-            .collect::<BTreeMap<_, _>>();
         let selected = preferred
-            .and_then(|key| by_key.get(&key).copied())
+            .and_then(|key| rows.iter().position(|row| row.key() == &key))
+            .map(RowIndex::new)
             .or_else(|| (!rows.is_empty()).then_some(RowIndex::new(0)));
 
         self.rows = rows;
-        self.by_key = by_key;
         self.selected = selected;
     }
 
@@ -337,24 +337,59 @@ fn pct(value: Bytes, percent: u64) -> Bytes {
 
 #[derive(Debug)]
 struct FoldPolicy<'a, Key> {
-    collapsed: &'a BTreeSet<Key>,
-    expanded: &'a BTreeSet<Key>,
+    overrides: &'a BTreeMap<Key, FoldOverride>,
     de_minimis: DeMinimis,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FoldOverride {
+    Collapsed,
+    Expanded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FoldMutation {
+    Collapse,
+    Expand,
+    Toggle,
+}
+
+impl FoldMutation {
+    fn apply(self, fold: RowFold) -> Option<FoldOverride> {
+        match (self, fold) {
+            (_, RowFold::Leaf) => None,
+            (Self::Collapse, _) | (Self::Toggle, RowFold::Expanded) => {
+                Some(FoldOverride::Collapsed)
+            }
+            (Self::Expand, _) | (Self::Toggle, RowFold::Collapsed) => Some(FoldOverride::Expanded),
+        }
+    }
+}
+
+enum FoldTarget {
+    Process(ProcessKey),
+    Tmpfs(PathBuf),
 }
 
 impl<Key: Ord> FoldPolicy<'_, Key> {
     #[must_use]
     fn row_fold(&self, key: &Key, depth: usize, has_children: bool, total: Bytes) -> RowFold {
-        if !has_children {
-            RowFold::Leaf
-        } else if self.collapsed.contains(key) {
-            RowFold::Collapsed
-        } else if self.expanded.contains(key) {
-            RowFold::Expanded
-        } else if depth > 0 && self.de_minimis.folds(total) {
-            RowFold::Collapsed
+        if has_children {
+            self.overrides.get(key).map_or_else(
+                || {
+                    if depth > 0 && self.de_minimis.folds(total) {
+                        RowFold::Collapsed
+                    } else {
+                        RowFold::Expanded
+                    }
+                },
+                |override_| match override_ {
+                    FoldOverride::Collapsed => RowFold::Collapsed,
+                    FoldOverride::Expanded => RowFold::Expanded,
+                },
+            )
         } else {
-            RowFold::Expanded
+            RowFold::Leaf
         }
     }
 }
@@ -371,13 +406,7 @@ enum SequenceResolution {
     Unmatched(KeyEvent),
     Pending,
     Cancelled,
-    Command(SequenceCommand),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SequenceCommand {
-    FirstRow,
-    LastRow,
+    Command(Action),
 }
 
 impl KeySequence {
@@ -387,11 +416,11 @@ impl KeySequence {
                 *self = Self::G;
                 SequenceResolution::Pending
             }
-            (Self::Root, Some('G')) => SequenceResolution::Command(SequenceCommand::LastRow),
+            (Self::Root, Some('G')) => SequenceResolution::Command(Action::LastRow),
             (Self::Root, _) => SequenceResolution::Unmatched(key),
             (Self::G, Some('g')) => {
                 *self = Self::Root;
-                SequenceResolution::Command(SequenceCommand::FirstRow)
+                SequenceResolution::Command(Action::FirstRow)
             }
             (Self::G, _) => {
                 *self = Self::Root;
@@ -421,37 +450,33 @@ fn plain_char(key: KeyEvent) -> Option<char> {
 pub struct App {
     pub tab: Tab,
     pub metric: Metric,
-    pub process_scope: ProcessScope,
+    pub tree_scope: TreeScope,
     focused: bool,
-    pub show_help: bool,
-    pub snapshot: Option<Snapshot>,
+    modal: Option<Modal>,
+    ledgers: Ledgers,
     pub last_error: Option<String>,
     pub process_scan_started_at: Option<Instant>,
     search: Option<Search>,
-    search_draft: Option<SearchDraft>,
     process_search: SearchSummary,
     tmpfs_search: SearchSummary,
     shared_search: SearchSummary,
-    collapsed_processes: BTreeSet<Pid>,
-    expanded_processes: BTreeSet<Pid>,
-    collapsed_tmpfs: BTreeSet<PathBuf>,
-    expanded_tmpfs: BTreeSet<PathBuf>,
-    process_mapping_cache: BTreeMap<Pid, ProcessMappingLedger>,
-    process_mapping_started_at: Option<(Pid, Instant)>,
+    process_folds: BTreeMap<ProcessKey, FoldOverride>,
+    tmpfs_folds: BTreeMap<PathBuf, FoldOverride>,
+    process_mappings: MappingLedgers,
     shared_scan_started_at: Option<Instant>,
-    pub deletions: Vec<DeleteTask>,
-    confirmed_deletions: BTreeSet<PathBuf>,
-    pub kill_confirmation: Option<KillConfirmation>,
-    inventory_warnings: Vec<String>,
-    tmpfs_refresh_warnings: Vec<String>,
-    process_warnings: Vec<String>,
-    pending_process_scan: Option<probe::ProcessScan>,
+    deletions: BTreeMap<PathBuf, DeletionState>,
     tmpfs_selection: SelectionCustody,
     process_rows: PaneRows<FlatProcessRow>,
     tmpfs_rows: PaneRows<FlatTmpfsRow>,
     shared_rows: PaneRows<FlatSharedRow>,
     page_rows: PageRows,
     key_sequence: KeySequence,
+}
+
+enum Modal {
+    Help,
+    Search(SearchDraft),
+    Kill(KillConfirmation),
 }
 
 pub struct KillConfirmation {
@@ -488,11 +513,15 @@ pub struct ProcessKillTarget {
 
 impl ProcessKillTarget {
     fn capture(process: &ProcessNode) -> std::result::Result<Self, String> {
+        let key = process.key();
+        probe::verify_process_identity(key).map_err(|error| format!("{error:#}"))?;
+        let pidfd = open_pidfd(process.pid)?;
+        probe::verify_process_identity(key).map_err(|error| format!("{error:#}"))?;
         Ok(Self {
             pid: process.pid,
             name: process.name.clone(),
             command: process.command.clone(),
-            pidfd: open_pidfd(process.pid)?,
+            pidfd,
         })
     }
 
@@ -511,30 +540,14 @@ impl ProcessKillTarget {
     }
 }
 
-pub struct ProcessMappingLedger {
-    pub pid: Pid,
-    pub elapsed: Duration,
-    pub cost: probe::ProcessMappingCost,
-    pub objects: Vec<ObjectUsage>,
-    pub mappings_state: LedgerState,
-}
-
-impl ProcessMappingLedger {
-    fn install(scan: probe::ProcessMappingScan) -> Self {
-        Self {
-            pid: scan.pid,
-            elapsed: scan.elapsed,
-            cost: scan.cost,
-            objects: scan.objects,
-            mappings_state: scan.mappings_state,
-        }
-    }
-}
-
-pub struct DeleteTask {
-    pub path: PathBuf,
+struct DeleteTask {
     mount_point: PathBuf,
     result: Receiver<DeleteOutcome>,
+}
+
+enum DeletionState {
+    Running(DeleteTask),
+    Confirmed,
 }
 
 enum DeleteOutcome {
@@ -542,18 +555,26 @@ enum DeleteOutcome {
     Failed(String),
 }
 
-#[derive(Clone, Debug)]
-enum TombstoneCoverage {
-    Full,
-    Mount(PathBuf),
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeleteKind {
+    Directory,
+    File,
 }
 
-impl TombstoneCoverage {
-    #[must_use]
-    fn covers(&self, path: &Path) -> bool {
-        match self {
-            Self::Full => true,
-            Self::Mount(mount_point) => path.starts_with(mount_point),
+impl TryFrom<TmpfsNodeKind> for DeleteKind {
+    type Error = ();
+
+    fn try_from(kind: TmpfsNodeKind) -> std::result::Result<Self, Self::Error> {
+        match kind {
+            TmpfsNodeKind::Mount => Err(()),
+            TmpfsNodeKind::Directory => Ok(Self::Directory),
+            TmpfsNodeKind::File
+            | TmpfsNodeKind::Symlink
+            | TmpfsNodeKind::Socket
+            | TmpfsNodeKind::Fifo
+            | TmpfsNodeKind::CharDevice
+            | TmpfsNodeKind::BlockDevice
+            | TmpfsNodeKind::Other => Ok(Self::File),
         }
     }
 }
@@ -564,31 +585,21 @@ impl App {
         Self {
             tab: Tab::Processes,
             metric: Metric::Pss,
-            process_scope: ProcessScope::SelfOnly,
+            tree_scope: TreeScope::SelfOnly,
             focused: true,
-            show_help: false,
-            snapshot: None,
+            modal: None,
+            ledgers: Ledgers::default(),
             last_error: None,
             process_scan_started_at: None,
             search: None,
-            search_draft: None,
             process_search: SearchSummary::new(Metric::Pss.label()),
             tmpfs_search: SearchSummary::new("allocated"),
             shared_search: SearchSummary::new(Metric::Pss.label()),
-            collapsed_processes: BTreeSet::new(),
-            expanded_processes: BTreeSet::new(),
-            collapsed_tmpfs: BTreeSet::new(),
-            expanded_tmpfs: BTreeSet::new(),
-            process_mapping_cache: BTreeMap::new(),
-            process_mapping_started_at: None,
+            process_folds: BTreeMap::new(),
+            tmpfs_folds: BTreeMap::new(),
+            process_mappings: MappingLedgers::default(),
             shared_scan_started_at: None,
-            deletions: Vec::new(),
-            confirmed_deletions: BTreeSet::new(),
-            kill_confirmation: None,
-            inventory_warnings: Vec::new(),
-            tmpfs_refresh_warnings: Vec::new(),
-            process_warnings: Vec::new(),
-            pending_process_scan: None,
+            deletions: BTreeMap::new(),
             tmpfs_selection: SelectionCustody::default(),
             process_rows: PaneRows::default(),
             tmpfs_rows: PaneRows::default(),
@@ -602,7 +613,7 @@ impl App {
         self.page_rows = PageRows::from_terminal_height(height);
     }
 
-    pub fn start_visible_work(&mut self, commands: &Sender<WorkerCommand>) {
+    pub fn start_visible_work(&mut self, commands: &WorkerPort) {
         self.request_current_pane(commands);
         self.sync_process_scanning(commands);
     }
@@ -612,7 +623,7 @@ impl App {
         self.focused
     }
 
-    pub fn set_focused(&mut self, focused: bool, commands: &Sender<WorkerCommand>) {
+    pub fn set_focused(&mut self, focused: bool, commands: &WorkerPort) {
         if self.focused == focused {
             return;
         }
@@ -620,13 +631,15 @@ impl App {
         self.sync_process_scanning(commands);
     }
 
-    pub fn apply_worker_event(&mut self, event: WorkerEvent, commands: &Sender<WorkerCommand>) {
+    pub fn apply_worker_event(&mut self, event: WorkerEvent, commands: &WorkerPort) {
         match event {
             WorkerEvent::InventoryReady(result) => self.apply_inventory_result(result),
             WorkerEvent::TmpfsMountReady(result) => self.apply_tmpfs_mount_result(result),
             WorkerEvent::ProcessesStarted(started) => self.process_scan_started_at = Some(started),
             WorkerEvent::ProcessesReady(result) => self.apply_process_result(result, commands),
-            WorkerEvent::ProcessMappingsReady(result) => self.apply_process_mappings_result(result),
+            WorkerEvent::ProcessMappingsReady(key, result) => {
+                self.apply_process_mappings_result(key, result);
+            }
             WorkerEvent::SharedObjectsStarted(started) => {
                 self.shared_scan_started_at = Some(started);
             }
@@ -634,21 +647,21 @@ impl App {
         }
     }
 
-    fn apply_inventory_result(&mut self, result: Result<Box<Snapshot>>) {
+    fn apply_inventory_result(&mut self, result: Result<Box<Ledger<Inventory>>>) {
         match result {
-            Ok(snapshot) => {
+            Ok(ledger) => {
                 self.last_error = None;
-                self.install_inventory_snapshot(*snapshot);
+                self.install_inventory(*ledger);
             }
             Err(error) => self.last_error = Some(format!("{error:#}")),
         }
     }
 
-    fn apply_tmpfs_mount_result(&mut self, result: Result<Box<probe::TmpfsMountScan>>) {
+    fn apply_tmpfs_mount_result(&mut self, result: Result<Box<Ledger<TmpfsMount>>>) {
         match result {
-            Ok(scan) => {
+            Ok(ledger) => {
                 self.last_error = None;
-                self.install_tmpfs_mount_scan(*scan);
+                self.install_tmpfs_mount(*ledger);
             }
             Err(error) => self.last_error = Some(format!("{error:#}")),
         }
@@ -656,165 +669,103 @@ impl App {
 
     fn apply_process_result(
         &mut self,
-        result: Result<Box<probe::ProcessScan>>,
-        commands: &Sender<WorkerCommand>,
+        result: Result<Box<Ledger<Processes>>>,
+        commands: &WorkerPort,
     ) {
         self.process_scan_started_at = None;
         match result {
-            Ok(scan) => {
+            Ok(ledger) => {
                 self.last_error = None;
-                self.install_process_scan(*scan);
+                self.install_processes(*ledger);
                 self.request_selected_process_mappings(commands);
             }
             Err(error) => self.last_error = Some(format!("{error:#}")),
         }
     }
 
-    fn apply_process_mappings_result(&mut self, result: Result<Box<probe::ProcessMappingScan>>) {
-        match result {
-            Ok(mut scan) => {
-                if self
-                    .process_mapping_started_at
-                    .is_some_and(|(pid, _)| pid == scan.pid)
-                {
-                    self.process_mapping_started_at = None;
-                }
-                self.process_warnings.append(&mut scan.warnings);
-                let ledger = ProcessMappingLedger::install(*scan);
-                let _ = self.process_mapping_cache.insert(ledger.pid, ledger);
-                self.last_error = None;
-                self.rebuild_snapshot_warnings();
-            }
-            Err(error) => {
-                self.process_mapping_started_at = None;
-                self.last_error = Some(format!("{error:#}"));
-            }
+    fn apply_process_mappings_result(
+        &mut self,
+        key: ProcessKey,
+        result: Result<Box<probe::ProcessMappingScan>>,
+    ) {
+        match self.process_mappings.finish(key, result) {
+            Ok(()) => self.last_error = None,
+            Err(error) => self.last_error = Some(format!("{error:#}")),
         }
     }
 
-    fn apply_shared_objects_result(&mut self, result: Result<Box<probe::SharedObjectsScan>>) {
+    fn apply_shared_objects_result(&mut self, result: Result<Box<Ledger<Shared>>>) {
         self.shared_scan_started_at = None;
         match result {
-            Ok(mut scan) => {
+            Ok(ledger) => {
                 self.last_error = None;
-                self.process_warnings.append(&mut scan.warnings);
-                self.install_shared_objects_scan(*scan);
+                self.install_shared(*ledger);
             }
             Err(error) => self.last_error = Some(format!("{error:#}")),
         }
     }
 
-    fn install_inventory_snapshot(&mut self, mut snapshot: Snapshot) {
-        self.inventory_warnings = std::mem::take(&mut snapshot.warnings);
-        self.tmpfs_refresh_warnings.clear();
-        let tmpfs_fresh = !snapshot.tmpfs_mounts.is_empty();
-        if let Some(current) = self.snapshot.take() {
-            snapshot.process_tree = current.process_tree;
-            snapshot.shared_objects = current.shared_objects;
-            if snapshot.tmpfs_mounts.is_empty() {
-                snapshot.tmpfs_mounts = current.tmpfs_mounts;
-            }
-        }
-        if tmpfs_fresh {
-            self.reconcile_confirmed_deletions(&snapshot.tmpfs_mounts, TombstoneCoverage::Full);
-        }
-        self.prune_tmpfs_tombstones(&mut snapshot.tmpfs_mounts);
-        probe::rebuild_snapshot_derived(&mut snapshot);
-        self.snapshot = Some(snapshot);
-        self.rebuild_snapshot_warnings();
-        if tmpfs_fresh {
-            self.rebuild_tmpfs_rows();
-        }
-
-        if let Some(scan) = self.pending_process_scan.take() {
-            self.install_process_scan(scan);
-        }
-        self.rebuild_shared_rows();
+    fn install_inventory(&mut self, ledger: Ledger<Inventory>) {
+        self.ledgers.install_inventory(ledger);
     }
 
-    fn install_process_scan(&mut self, mut scan: probe::ProcessScan) {
-        self.process_warnings = std::mem::take(&mut scan.warnings);
-        if self.snapshot.is_none() {
-            self.snapshot = Some(empty_snapshot(scan.meminfo.clone()));
-        }
-        let Some(snapshot) = self.snapshot.as_mut() else {
-            self.pending_process_scan = Some(scan);
-            return;
-        };
-        scan.install(snapshot);
-        self.rebuild_snapshot_warnings();
+    fn install_processes(&mut self, ledger: Ledger<Processes>) {
+        self.ledgers.install_processes(ledger);
         self.rebuild_process_rows();
-        self.retain_live_process_mapping_cache();
+        self.retain_live_process_mappings();
     }
 
-    fn install_shared_objects_scan(&mut self, scan: probe::SharedObjectsScan) {
-        if self.snapshot.is_none() {
-            self.snapshot = Some(empty_snapshot(scan.meminfo.clone()));
-        }
-        let Some(snapshot) = self.snapshot.as_mut() else {
-            return;
-        };
-        snapshot.captured_at = scan.captured_at;
-        snapshot.elapsed = scan.elapsed;
-        snapshot.meminfo = scan.meminfo;
-        snapshot.shared_objects = scan.shared_objects;
-        probe::rebuild_snapshot_derived(snapshot);
-        self.rebuild_snapshot_warnings();
+    fn install_shared(&mut self, ledger: Ledger<Shared>) {
+        self.ledgers.install_shared(ledger);
         self.rebuild_shared_rows();
     }
 
-    fn install_tmpfs_mount_scan(&mut self, mut scan: probe::TmpfsMountScan) {
-        self.tmpfs_refresh_warnings = std::mem::take(&mut scan.warnings);
-        self.reconcile_confirmed_deletions(
-            std::slice::from_ref(&scan.mount),
-            TombstoneCoverage::Mount(scan.mount.mount_point.clone()),
-        );
-        self.prune_tmpfs_tombstones(std::slice::from_mut(&mut scan.mount));
-        if self.snapshot.is_none() {
-            self.snapshot = Some(empty_snapshot(Meminfo::default()));
-        }
-        let Some(snapshot) = self.snapshot.as_mut() else {
-            return;
-        };
+    fn install_tmpfs_mount(&mut self, ledger: Ledger<TmpfsMount>) {
+        let Ledger {
+            stamp,
+            mut value,
+            warnings,
+        } = ledger;
+        let mount_point = value.mount_point.clone();
+        self.reconcile_confirmed_deletions(std::slice::from_ref(&value), &mount_point);
+        self.prune_tmpfs_tombstones(std::slice::from_mut(&mut value));
 
-        snapshot.captured_at = scan.captured_at;
-        snapshot.elapsed = scan.elapsed;
-        if let Some(slot) = snapshot
-            .tmpfs_mounts
+        self.ledgers.last_stamp = Some(stamp);
+        let tmpfs = self.ledgers.tmpfs.get_or_insert_with(|| Ledger {
+            stamp,
+            value: Tmpfs {
+                mounts: Vec::new(),
+                allocated_total: Bytes::ZERO,
+            },
+            warnings: Vec::new(),
+        });
+        tmpfs.stamp = stamp;
+        tmpfs.warnings = warnings;
+        if let Some(slot) = tmpfs
+            .value
+            .mounts
             .iter_mut()
-            .find(|mount| mount.mount_point == scan.mount.mount_point)
+            .find(|mount| mount.mount_point == value.mount_point)
         {
-            *slot = scan.mount;
+            *slot = value;
         } else {
-            snapshot.tmpfs_mounts.push(scan.mount);
+            tmpfs.value.mounts.push(value);
         }
-        snapshot
-            .tmpfs_mounts
+        tmpfs
+            .value
+            .mounts
             .sort_by_key(|mount| std::cmp::Reverse(mount.root.allocated));
-        probe::rebuild_snapshot_derived(snapshot);
-        self.rebuild_snapshot_warnings();
+        tmpfs.value.allocated_total = tmpfs
+            .value
+            .mounts
+            .iter()
+            .map(|mount| mount.root.allocated)
+            .fold(Bytes::ZERO, |total, allocated| total + allocated);
         self.rebuild_tmpfs_rows();
     }
 
-    fn rebuild_snapshot_warnings(&mut self) {
-        let Some(snapshot) = self.snapshot.as_mut() else {
-            return;
-        };
-        let mut warnings = Vec::with_capacity(
-            self.inventory_warnings.len()
-                + self.tmpfs_refresh_warnings.len()
-                + self.process_warnings.len(),
-        );
-        warnings.extend(self.inventory_warnings.iter().cloned());
-        warnings.extend(self.tmpfs_refresh_warnings.iter().cloned());
-        warnings.extend(self.process_warnings.iter().cloned());
-        snapshot.warnings = warnings;
-    }
-
     fn tmpfs_tombstones(&self) -> BTreeSet<PathBuf> {
-        let mut tombstones = self.confirmed_deletions.clone();
-        tombstones.extend(self.deletions.iter().map(|task| task.path.clone()));
-        tombstones
+        self.deletions.keys().cloned().collect()
     }
 
     fn prune_tmpfs_tombstones(&self, mounts: &mut [TmpfsMount]) {
@@ -825,21 +776,17 @@ impl App {
     fn prune_tmpfs_path(&mut self, path: &Path) {
         let mut tombstones = self.tmpfs_tombstones();
         let _ = tombstones.insert(path.to_path_buf());
-        let Some(snapshot) = self.snapshot.as_mut() else {
+        let Some(tmpfs) = self.ledgers.tmpfs_data_mut() else {
             return;
         };
-        prune_tmpfs_tombstones(&mut snapshot.tmpfs_mounts, &tombstones);
-        probe::rebuild_snapshot_derived(snapshot);
+        prune_tmpfs_tombstones(&mut tmpfs.mounts, &tombstones);
+        tmpfs.allocated_total = tmpfs_allocated_total(&tmpfs.mounts);
         self.rebuild_tmpfs_rows();
     }
 
-    fn reconcile_confirmed_deletions(
-        &mut self,
-        mounts: &[TmpfsMount],
-        coverage: TombstoneCoverage,
-    ) {
-        self.confirmed_deletions.retain(|path| {
-            if !coverage.covers(path) {
+    fn reconcile_confirmed_deletions(&mut self, mounts: &[TmpfsMount], mount_point: &Path) {
+        self.deletions.retain(|path, state| {
+            if matches!(state, DeletionState::Running(_)) || !path.starts_with(mount_point) {
                 return true;
             }
             mounts
@@ -849,34 +796,45 @@ impl App {
         });
     }
 
-    pub fn poll_deletion(&mut self, commands: &Sender<WorkerCommand>) -> bool {
+    pub fn poll_deletion(&mut self, commands: &WorkerPort) -> bool {
         let mut changed = false;
-        let mut index = 0;
-        while index < self.deletions.len() {
-            match self.deletions[index].result.try_recv() {
+        let running = self
+            .deletions
+            .iter()
+            .filter(|&(_path, state)| matches!(state, DeletionState::Running(_)))
+            .map(|(path, _state)| path.clone())
+            .collect::<Vec<_>>();
+        for path in running {
+            let outcome = match self.deletions.get(&path) {
+                Some(DeletionState::Running(task)) => task.result.try_recv(),
+                Some(DeletionState::Confirmed) | None => continue,
+            };
+            match outcome {
                 Ok(DeleteOutcome::Deleted) => {
-                    let task = self.deletions.remove(index);
-                    let _ = self.confirmed_deletions.insert(task.path);
+                    let Some(DeletionState::Running(task)) = self.deletions.remove(&path) else {
+                        continue;
+                    };
+                    let _ = self.deletions.insert(path, DeletionState::Confirmed);
                     self.last_error = None;
-                    let _ = commands.send(WorkerCommand::RefreshTmpfsMount(task.mount_point));
+                    commands.refresh_tmpfs_mount(task.mount_point);
                     changed = true;
                 }
                 Ok(DeleteOutcome::Failed(error)) => {
-                    let task = self.deletions.remove(index);
-                    let _ = self.confirmed_deletions.remove(&task.path);
+                    let Some(DeletionState::Running(task)) = self.deletions.remove(&path) else {
+                        continue;
+                    };
                     self.last_error = Some(error);
-                    let _ = commands.send(WorkerCommand::RefreshTmpfsMount(task.mount_point));
+                    commands.refresh_tmpfs_mount(task.mount_point);
                     changed = true;
                 }
-                Err(TryRecvError::Empty) => index += 1,
+                Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
-                    let task = self.deletions.remove(index);
-                    let _ = self.confirmed_deletions.remove(&task.path);
-                    self.last_error = Some(format!(
-                        "delete task disconnected for {}",
-                        task.path.display()
-                    ));
-                    let _ = commands.send(WorkerCommand::RefreshTmpfsMount(task.mount_point));
+                    let Some(DeletionState::Running(task)) = self.deletions.remove(&path) else {
+                        continue;
+                    };
+                    self.last_error =
+                        Some(format!("delete task disconnected for {}", path.display()));
+                    commands.refresh_tmpfs_mount(task.mount_point);
                     changed = true;
                 }
             }
@@ -887,9 +845,9 @@ impl App {
     #[must_use]
     pub fn needs_periodic_redraw(&self) -> bool {
         self.focused
-            && (self.kill_confirmation.is_some()
+            && (self.kill_confirmation().is_some()
                 || self.process_scan_started_at.is_some()
-                || self.process_mapping_started_at.is_some()
+                || self.process_mappings.is_loading()
                 || self.shared_scan_started_at.is_some())
     }
 
@@ -910,34 +868,95 @@ impl App {
 
     #[must_use]
     pub fn current_time_label(&self) -> String {
-        let Some(snapshot) = self.snapshot.as_ref() else {
+        let Some(stamp) = self.ledgers.last_stamp else {
             return "loading".to_string();
         };
-        match snapshot.captured_at.duration_since(SystemTime::UNIX_EPOCH) {
+        match stamp.captured_at.duration_since(SystemTime::UNIX_EPOCH) {
             Ok(since_epoch) => format!("captured {}", since_epoch.as_secs()),
             Err(_) => "captured".to_string(),
         }
     }
 
     #[must_use]
-    pub fn hotkey_sections(&self) -> HotkeySections {
-        HotkeySections {
-            global: super::nav::global_hotkeys(),
+    pub fn active_ledger_ready(&self) -> bool {
+        match self.tab {
+            Tab::Overview => self.ledgers.meminfo().is_some(),
+            Tab::Processes => self.ledgers.processes.is_some(),
+            Tab::Tmpfs => self.ledgers.tmpfs.is_some(),
+            Tab::Shared => self.ledgers.shared.is_some(),
+        }
+    }
+
+    #[must_use]
+    pub fn meminfo(&self) -> Option<&Meminfo> {
+        self.ledgers.meminfo()
+    }
+
+    #[must_use]
+    pub fn inventory(&self) -> Option<&Inventory> {
+        self.ledgers.inventory.as_ref().map(|ledger| &ledger.value)
+    }
+
+    #[must_use]
+    pub fn processes(&self) -> Option<&Processes> {
+        self.ledgers.process_data()
+    }
+
+    #[must_use]
+    pub fn tmpfs(&self) -> Option<&Tmpfs> {
+        self.ledgers.tmpfs_data()
+    }
+
+    #[must_use]
+    pub fn shared(&self) -> Option<&Shared> {
+        self.ledgers.shared_data()
+    }
+
+    #[must_use]
+    pub fn last_capture_elapsed(&self) -> Duration {
+        self.ledgers
+            .last_stamp
+            .map_or(Duration::ZERO, |stamp| stamp.elapsed)
+    }
+
+    #[must_use]
+    pub fn warnings(&self) -> Vec<&str> {
+        let mut warnings = Vec::new();
+        if let Some(ledger) = &self.ledgers.inventory {
+            warnings.extend(ledger.warnings.iter().map(String::as_str));
+        }
+        if let Some(ledger) = &self.ledgers.processes {
+            warnings.extend(ledger.warnings.iter().map(String::as_str));
+        }
+        if let Some(ledger) = &self.ledgers.tmpfs {
+            warnings.extend(ledger.warnings.iter().map(String::as_str));
+        }
+        if let Some(ledger) = &self.ledgers.shared {
+            warnings.extend(ledger.warnings.iter().map(String::as_str));
+        }
+        warnings.extend(self.process_mappings.warnings());
+        warnings
+    }
+
+    #[must_use]
+    pub fn binding_sections(&self) -> BindingSections {
+        BindingSections {
+            global: nav::global_bindings(),
             pane_title: self.tab.title(),
-            pane: self.tab.hotkeys(),
+            navigation: self.tab.navigation(),
+            pane: self.tab.bindings(),
         }
     }
 
     fn rebuild_process_rows(&mut self) {
-        let (rows, summary) = self.snapshot.as_ref().map_or_else(
+        let (rows, summary) = self.ledgers.process_data().map_or_else(
             || (Vec::new(), SearchSummary::new(self.metric.label())),
-            |snapshot| {
+            |processes| {
                 build_process_rows(
-                    snapshot,
+                    processes,
                     self.metric,
-                    self.process_scope,
-                    &self.collapsed_processes,
-                    &self.expanded_processes,
+                    self.tree_scope,
+                    &self.process_folds,
                     self.search.as_ref(),
                 )
             },
@@ -947,14 +966,18 @@ impl App {
     }
 
     fn rebuild_tmpfs_rows(&mut self) {
-        let (rows, summary) = self.snapshot.as_ref().map_or_else(
+        let capacity = self
+            .ledgers
+            .meminfo()
+            .map_or(Bytes::ZERO, |meminfo| meminfo.get("MemTotal"));
+        let (rows, summary) = self.ledgers.tmpfs_data().map_or_else(
             || (Vec::new(), SearchSummary::new("allocated")),
-            |snapshot| {
+            |tmpfs| {
                 build_tmpfs_rows(
-                    snapshot,
-                    self.process_scope,
-                    &self.collapsed_tmpfs,
-                    &self.expanded_tmpfs,
+                    tmpfs,
+                    capacity,
+                    self.tree_scope,
+                    &self.tmpfs_folds,
                     self.search.as_ref(),
                 )
             },
@@ -968,9 +991,9 @@ impl App {
     }
 
     fn rebuild_shared_rows(&mut self) {
-        let (rows, summary) = self.snapshot.as_ref().map_or_else(
+        let (rows, summary) = self.ledgers.shared_data().map_or_else(
             || (Vec::new(), SearchSummary::new(self.metric.label())),
-            |snapshot| build_shared_rows(snapshot, self.metric, self.search.as_ref()),
+            |shared| build_shared_rows(shared, self.metric, self.search.as_ref()),
         );
         self.shared_search = summary;
         self.shared_rows.install(rows);
@@ -983,7 +1006,23 @@ impl App {
 
     #[must_use]
     pub fn search_draft(&self) -> Option<&SearchDraft> {
-        self.search_draft.as_ref()
+        match &self.modal {
+            Some(Modal::Search(draft)) => Some(draft),
+            Some(Modal::Help | Modal::Kill(_)) | None => None,
+        }
+    }
+
+    #[must_use]
+    pub fn help_open(&self) -> bool {
+        matches!(self.modal, Some(Modal::Help))
+    }
+
+    #[must_use]
+    pub fn kill_confirmation(&self) -> Option<&KillConfirmation> {
+        match &self.modal {
+            Some(Modal::Kill(confirmation)) => Some(confirmation),
+            Some(Modal::Help | Modal::Search(_)) | None => None,
+        }
     }
 
     #[must_use]
@@ -999,12 +1038,15 @@ impl App {
 
     #[must_use]
     pub fn search_scope_label(&self) -> &'static str {
-        self.process_scope.label()
+        self.tree_scope.label()
     }
 
     #[must_use]
     pub fn deletion_count(&self) -> usize {
-        self.deletions.len()
+        self.deletions
+            .values()
+            .filter(|state| matches!(state, DeletionState::Running(_)))
+            .count()
     }
 
     #[must_use]
@@ -1045,8 +1087,7 @@ impl App {
     #[must_use]
     pub fn selected_process(&self) -> Option<&ProcessNode> {
         let row = self.process_rows.selected()?;
-        let snapshot = self.snapshot.as_ref()?;
-        snapshot.process_tree.nodes.get(row.index)
+        self.ledgers.process_data()?.tree.nodes.get(row.index)
     }
 
     #[must_use]
@@ -1054,9 +1095,7 @@ impl App {
         let Some(process) = self.selected_process() else {
             return &[];
         };
-        self.process_mapping_cache
-            .get(&process.pid)
-            .map_or(&[], |ledger| ledger.objects.as_slice())
+        self.process_mappings.objects(process.key())
     }
 
     #[must_use]
@@ -1064,24 +1103,16 @@ impl App {
         let Some(process) = self.selected_process() else {
             return "none";
         };
-        if self
-            .process_mapping_started_at
-            .is_some_and(|(pid, _)| pid == process.pid)
-        {
-            return "loading";
-        }
-        self.process_mapping_cache
-            .get(&process.pid)
-            .map_or(process.mappings_state.label(), |ledger| {
-                ledger.mappings_state.label()
-            })
+        self.process_mappings
+            .state(process.key(), process.mappings_state)
     }
 
     #[must_use]
     pub fn selected_process_mapping_loading(&self) -> Option<(Pid, Duration)> {
         let process = self.selected_process()?;
-        let (pid, started_at) = self.process_mapping_started_at?;
-        (pid == process.pid).then_some((pid, started_at.elapsed()))
+        self.process_mappings
+            .loading(process.key())
+            .map(|elapsed| (process.pid, elapsed))
     }
 
     #[must_use]
@@ -1092,23 +1123,12 @@ impl App {
         let Some(process) = self.selected_process() else {
             return "none".to_string();
         };
-        self.process_mapping_cache.get(&process.pid).map_or_else(
-            || "not loaded".to_string(),
-            |ledger| {
-                format!(
-                    "{} ms (mount {} read {} parse {})",
-                    ledger.elapsed.as_millis(),
-                    ledger.cost.mount_index.as_millis(),
-                    ledger.cost.read.as_millis(),
-                    ledger.cost.parse.as_millis()
-                )
-            },
-        )
+        self.process_mappings.scan_label(process.key())
     }
 
     #[must_use]
     pub fn process_mapping_started_at(&self) -> Option<(Pid, Instant)> {
-        self.process_mapping_started_at
+        self.process_mappings.first_loading()
     }
 
     #[must_use]
@@ -1118,103 +1138,84 @@ impl App {
 
     #[must_use]
     pub fn selected_tmpfs_mount(&self) -> Option<&TmpfsMount> {
-        let snapshot = self.snapshot.as_ref()?;
         let row = self.tmpfs_rows.selected()?;
-        snapshot.tmpfs_mounts.get(row.mount_index)
+        self.ledgers.tmpfs_data()?.mounts.get(row.mount_index)
     }
 
     #[must_use]
     pub fn selected_shared_object(&self) -> Option<&SharedObject> {
         let row = self.shared_rows.selected()?;
-        self.snapshot.as_ref()?.shared_objects.get(row.index)
+        self.ledgers.shared_data()?.objects.get(row.index)
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent, commands: &Sender<WorkerCommand>) -> bool {
-        if self.kill_confirmation.is_some() {
+    pub fn handle_key(&mut self, key: KeyEvent, commands: &WorkerPort) -> bool {
+        if self.kill_confirmation().is_some() {
             return self.handle_kill_confirmation_key(key, commands);
         }
-        if self.search_draft.is_some() {
+        if self.search_draft().is_some() {
             return self.handle_search_key(key);
         }
-        if self.show_help {
+        if self.help_open() {
             return self.handle_help_key(key);
-        }
-        if matches!(key.code, KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL)) {
-            return true;
         }
 
         match self.key_sequence.resolve(key) {
             SequenceResolution::Unmatched(key) => self.handle_single_key(key, commands),
             SequenceResolution::Pending | SequenceResolution::Cancelled => false,
-            SequenceResolution::Command(command) => {
-                self.handle_sequence_command(command, commands);
-                false
-            }
+            SequenceResolution::Command(action) => self.execute(action, commands),
         }
     }
 
-    fn handle_single_key(&mut self, key: KeyEvent, commands: &Sender<WorkerCommand>) -> bool {
-        match key.code {
-            KeyCode::Char('q') => return true,
-            KeyCode::Esc => {}
-            KeyCode::Char('?') => self.show_help = !self.show_help,
-            KeyCode::Char('/') => self.open_search(),
-            KeyCode::Char('f') => self.clear_search(),
-            KeyCode::Tab => self.select_tab(self.tab.next(), commands),
-            KeyCode::BackTab => self.select_tab(self.tab.previous(), commands),
-            KeyCode::Char('1') => self.select_tab(Tab::Overview, commands),
-            KeyCode::Char('2') => self.select_tab(Tab::Processes, commands),
-            KeyCode::Char('3') => self.select_tab(Tab::Tmpfs, commands),
-            KeyCode::Char('4') => self.select_tab(Tab::Shared, commands),
-            KeyCode::Char('s') => {
+    fn handle_single_key(&mut self, key: KeyEvent, commands: &WorkerPort) -> bool {
+        nav::resolve(self.tab, key).is_some_and(|action| self.execute(action, commands))
+    }
+
+    fn execute(&mut self, action: Action, commands: &WorkerPort) -> bool {
+        match action {
+            Action::Ignore => {}
+            Action::Quit => return true,
+            Action::ShowHelp => self.modal = Some(Modal::Help),
+            Action::OpenSearch => self.open_search(),
+            Action::ClearSearch => self.clear_search(),
+            Action::NextTab => self.select_tab(self.tab.next(), commands),
+            Action::PreviousTab => self.select_tab(self.tab.previous(), commands),
+            Action::SelectTab(tab) => self.select_tab(tab, commands),
+            Action::CycleMetric => {
                 self.metric = self.metric.next();
                 self.rebuild_process_rows();
                 self.rebuild_shared_rows();
             }
-            KeyCode::Char('m') => {
-                self.process_scope = self.process_scope.next();
+            Action::CycleScope => {
+                self.tree_scope = self.tree_scope.next();
                 self.rebuild_filterable_rows();
             }
-            KeyCode::Char('d') => self.delete_current_tmpfs_entry(),
-            KeyCode::Char('K') => self.arm_process_kill(),
-            KeyCode::Char('r') => self.refresh_current_pane(commands),
-            KeyCode::Down | KeyCode::Char('j') => {
-                let _ = self.move_selection_and_request_mappings(1, commands);
+            Action::Delete => self.delete_current_tmpfs_entry(),
+            Action::Kill => self.arm_process_kill(),
+            Action::Refresh => self.refresh_current_pane(commands),
+            Action::Move(delta) => {
+                let _ = self.move_selection_and_request_mappings(delta, commands);
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                let _ = self.move_selection_and_request_mappings(-1, commands);
-            }
-            KeyCode::PageDown => {
+            Action::PageDown => {
                 let _ = self.page_selection_and_request_mappings(PageDirection::Down, commands);
             }
-            KeyCode::PageUp => {
+            Action::PageUp => {
                 let _ = self.page_selection_and_request_mappings(PageDirection::Up, commands);
             }
-            KeyCode::Left | KeyCode::Char('h') => self.collapse_current(),
-            KeyCode::Right | KeyCode::Char('l') => self.expand_current(),
-            KeyCode::Enter => self.toggle_current(),
-            _ => {}
+            Action::Collapse => self.mutate_current_fold(FoldMutation::Collapse),
+            Action::Expand => self.mutate_current_fold(FoldMutation::Expand),
+            Action::Toggle => self.mutate_current_fold(FoldMutation::Toggle),
+            Action::FirstRow => {
+                let _ = self.select_edge_and_request_mappings(RowEdge::First, commands);
+            }
+            Action::LastRow => {
+                let _ = self.select_edge_and_request_mappings(RowEdge::Last, commands);
+            }
         }
         false
     }
 
-    fn handle_sequence_command(
-        &mut self,
-        command: SequenceCommand,
-        commands: &Sender<WorkerCommand>,
-    ) {
-        match command {
-            SequenceCommand::FirstRow => {
-                let _ = self.select_edge_and_request_mappings(RowEdge::First, commands);
-            }
-            SequenceCommand::LastRow => {
-                let _ = self.select_edge_and_request_mappings(RowEdge::Last, commands);
-            }
-        }
-    }
-
-    pub fn handle_mouse(&mut self, mouse: MouseEvent, commands: &Sender<WorkerCommand>) -> bool {
-        if self.kill_confirmation.is_some() || self.show_help {
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, commands: &WorkerPort) -> bool {
+        if self.modal.is_some() {
             return false;
         }
         self.key_sequence = KeySequence::Root;
@@ -1230,7 +1231,7 @@ impl App {
         }
     }
 
-    fn select_tab(&mut self, tab: Tab, commands: &Sender<WorkerCommand>) {
+    fn select_tab(&mut self, tab: Tab, commands: &WorkerPort) {
         self.tab = tab;
         if tab == Tab::Tmpfs {
             self.seize_tmpfs_selection();
@@ -1239,84 +1240,64 @@ impl App {
         self.sync_process_scanning(commands);
     }
 
-    fn sync_process_scanning(&self, commands: &Sender<WorkerCommand>) {
-        let _ = commands.send(WorkerCommand::SetProcessScanning(
-            self.focused && self.tab.drives_process_scans(),
-        ));
+    fn sync_process_scanning(&self, commands: &WorkerPort) {
+        commands.set_process_scanning(self.focused && self.tab.drives_process_scans());
     }
 
-    fn request_current_pane(&mut self, commands: &Sender<WorkerCommand>) {
+    fn request_current_pane(&mut self, commands: &WorkerPort) {
         match self.tab {
-            Tab::Overview => {
-                let _ = commands.send(WorkerCommand::RefreshInventory);
-            }
+            Tab::Overview => commands.refresh_inventory(),
             Tab::Processes => self.request_selected_process_mappings(commands),
-            Tab::Tmpfs => {
-                let _ = commands.send(WorkerCommand::RefreshTmpfsMounts);
-            }
-            Tab::Shared => {
-                let _ = commands.send(WorkerCommand::RefreshSharedObjects);
-            }
+            Tab::Tmpfs => commands.refresh_tmpfs(),
+            Tab::Shared => commands.refresh_shared(),
         }
     }
 
-    fn request_selected_process_mappings(&mut self, commands: &Sender<WorkerCommand>) {
+    fn request_selected_process_mappings(&mut self, commands: &WorkerPort) {
         if self.tab != Tab::Processes {
             return;
         }
         let Some(process) = self.selected_process() else {
             return;
         };
-        if self.process_mapping_cache.contains_key(&process.pid)
-            || self
-                .process_mapping_started_at
-                .is_some_and(|(pid, _)| pid == process.pid)
-        {
-            return;
+        let key = process.key();
+        if self.process_mappings.begin(key) {
+            commands.refresh_process_mappings(key);
         }
-        let pid = process.pid;
-        self.process_mapping_started_at = Some((pid, Instant::now()));
-        let _ = commands.send(WorkerCommand::RefreshProcessMappings(pid));
     }
 
-    fn retain_live_process_mapping_cache(&mut self) {
-        let Some(snapshot) = self.snapshot.as_ref() else {
-            self.process_mapping_cache.clear();
-            self.process_mapping_started_at = None;
+    fn retain_live_process_mappings(&mut self) {
+        let Some(processes) = self.ledgers.process_data() else {
+            self.process_mappings.clear();
             return;
         };
-        let live = snapshot
-            .process_tree
+        let live = processes
+            .tree
             .nodes
             .iter()
-            .map(|node| node.pid)
+            .map(|node| node.key())
             .collect::<BTreeSet<_>>();
-        self.process_mapping_cache
-            .retain(|pid, _ledger| live.contains(pid));
-        if self
-            .process_mapping_started_at
-            .is_some_and(|(pid, _)| !live.contains(&pid))
-        {
-            self.process_mapping_started_at = None;
-        }
+        self.process_mappings.retain(&live);
     }
 
-    fn refresh_current_pane(&mut self, commands: &Sender<WorkerCommand>) {
-        let command = match self.tab {
-            Tab::Overview => WorkerCommand::RefreshInventory,
-            Tab::Processes => WorkerCommand::RefreshProcesses,
-            Tab::Tmpfs => self
-                .selected_tmpfs_mount()
-                .map(|mount| WorkerCommand::RefreshTmpfsMount(mount.mount_point.clone()))
-                .unwrap_or(WorkerCommand::RefreshTmpfsMounts),
-            Tab::Shared => WorkerCommand::RefreshSharedObjects,
-        };
-        let _ = commands.send(command);
+    fn refresh_current_pane(&mut self, commands: &WorkerPort) {
+        match self.tab {
+            Tab::Overview => commands.refresh_inventory(),
+            Tab::Processes => commands.refresh_processes(),
+            Tab::Tmpfs => {
+                if let Some(mount) = self.selected_tmpfs_mount() {
+                    commands.refresh_tmpfs_mount(mount.mount_point.clone());
+                } else {
+                    commands.refresh_tmpfs();
+                }
+            }
+            Tab::Shared => commands.refresh_shared(),
+        }
     }
 
     fn open_search(&mut self) {
         self.key_sequence = KeySequence::Root;
-        self.search_draft = Some(SearchDraft::new(self.search.as_ref()));
+        self.modal = Some(Modal::Search(SearchDraft::new(self.search.as_ref())));
     }
 
     fn clear_search(&mut self) {
@@ -1329,7 +1310,7 @@ impl App {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
             KeyCode::Esc => {
-                self.search_draft = None;
+                self.modal = None;
                 false
             }
             KeyCode::Enter => {
@@ -1337,19 +1318,19 @@ impl App {
                 false
             }
             KeyCode::Backspace => {
-                if let Some(draft) = self.search_draft.as_mut() {
+                if let Some(Modal::Search(draft)) = self.modal.as_mut() {
                     draft.backspace();
                 }
                 false
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(draft) = self.search_draft.as_mut() {
+                if let Some(Modal::Search(draft)) = self.modal.as_mut() {
                     draft.clear();
                 }
                 false
             }
             KeyCode::Char(character) if plain_char(key).is_some() => {
-                if let Some(draft) = self.search_draft.as_mut() {
+                if let Some(Modal::Search(draft)) = self.modal.as_mut() {
                     draft.push(character);
                 }
                 false
@@ -1359,7 +1340,7 @@ impl App {
     }
 
     fn commit_search(&mut self) {
-        let Some(draft) = self.search_draft.take() else {
+        let Some(Modal::Search(draft)) = self.modal.take() else {
             return;
         };
         let input = draft.into_input();
@@ -1371,7 +1352,7 @@ impl App {
             Err(error) => {
                 let mut draft = SearchDraft::from_input(input);
                 draft.fail(error);
-                self.search_draft = Some(draft);
+                self.modal = Some(Modal::Search(draft));
             }
         }
     }
@@ -1380,28 +1361,23 @@ impl App {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
             KeyCode::Esc | KeyCode::Char('?') => {
-                self.show_help = false;
+                self.modal = None;
                 false
             }
             _ => false,
         }
     }
 
-    fn handle_kill_confirmation_key(
-        &mut self,
-        key: KeyEvent,
-        commands: &Sender<WorkerCommand>,
-    ) -> bool {
+    fn handle_kill_confirmation_key(&mut self, key: KeyEvent, commands: &WorkerPort) -> bool {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
             KeyCode::Esc | KeyCode::Char('n') => {
-                self.kill_confirmation = None;
+                self.modal = None;
                 false
             }
             KeyCode::Char('y')
                 if self
-                    .kill_confirmation
-                    .as_ref()
+                    .kill_confirmation()
                     .is_some_and(KillConfirmation::armed) =>
             {
                 self.confirm_process_kill(commands);
@@ -1432,11 +1408,7 @@ impl App {
         self.move_selection(self.page_rows.delta(direction))
     }
 
-    fn move_selection_and_request_mappings(
-        &mut self,
-        delta: isize,
-        commands: &Sender<WorkerCommand>,
-    ) -> bool {
+    fn move_selection_and_request_mappings(&mut self, delta: isize, commands: &WorkerPort) -> bool {
         let changed = self.move_selection(delta);
         self.request_selected_process_mappings_after(changed, commands)
     }
@@ -1444,17 +1416,13 @@ impl App {
     fn page_selection_and_request_mappings(
         &mut self,
         direction: PageDirection,
-        commands: &Sender<WorkerCommand>,
+        commands: &WorkerPort,
     ) -> bool {
         let changed = self.page_selection(direction);
         self.request_selected_process_mappings_after(changed, commands)
     }
 
-    fn select_edge_and_request_mappings(
-        &mut self,
-        edge: RowEdge,
-        commands: &Sender<WorkerCommand>,
-    ) -> bool {
+    fn select_edge_and_request_mappings(&mut self, edge: RowEdge, commands: &WorkerPort) -> bool {
         let changed = self.select_edge(edge);
         self.request_selected_process_mappings_after(changed, commands)
     }
@@ -1462,7 +1430,7 @@ impl App {
     fn request_selected_process_mappings_after(
         &mut self,
         changed: bool,
-        commands: &Sender<WorkerCommand>,
+        commands: &WorkerPort,
     ) -> bool {
         if changed {
             self.request_selected_process_mappings(commands);
@@ -1479,107 +1447,32 @@ impl App {
         }
     }
 
-    fn collapse_current(&mut self) {
-        match self.tab {
-            Tab::Processes => {
-                let Some((pid, fold)) = self.process_rows.selected().map(|row| (row.pid, row.fold))
-                else {
-                    return;
-                };
-                if fold != RowFold::Leaf {
-                    let _ = self.expanded_processes.remove(&pid);
-                    let _ = self.collapsed_processes.insert(pid);
-                    self.rebuild_process_rows();
-                }
-            }
-            Tab::Tmpfs => {
-                let Some((path, fold)) = self
-                    .tmpfs_rows
-                    .selected()
-                    .map(|row| (row.path.clone(), row.fold))
-                else {
-                    return;
-                };
-                if fold != RowFold::Leaf {
-                    let _ = self.expanded_tmpfs.remove(&path);
-                    let _ = self.collapsed_tmpfs.insert(path);
-                    self.rebuild_tmpfs_rows();
-                }
-            }
-            Tab::Overview | Tab::Shared => {}
-        }
-    }
-
-    fn expand_current(&mut self) {
-        match self.tab {
-            Tab::Processes => {
-                if let Some((pid, fold)) =
-                    self.process_rows.selected().map(|row| (row.pid, row.fold))
-                    && fold != RowFold::Leaf
-                {
-                    let _ = self.collapsed_processes.remove(&pid);
-                    let _ = self.expanded_processes.insert(pid);
-                    self.rebuild_process_rows();
-                }
-            }
-            Tab::Tmpfs => {
-                if let Some((path, fold)) = self
-                    .tmpfs_rows
-                    .selected()
-                    .map(|row| (row.path.clone(), row.fold))
-                    && fold != RowFold::Leaf
-                {
-                    let _ = self.collapsed_tmpfs.remove(&path);
-                    let _ = self.expanded_tmpfs.insert(path);
-                    self.rebuild_tmpfs_rows();
-                }
-            }
-            Tab::Overview | Tab::Shared => {}
-        }
-    }
-
-    fn toggle_current(&mut self) {
-        match self.tab {
-            Tab::Processes => {
-                let Some((pid, fold)) = self.process_rows.selected().map(|row| (row.pid, row.fold))
-                else {
-                    return;
-                };
-                match fold {
-                    RowFold::Leaf => return,
-                    RowFold::Collapsed => {
-                        let _ = self.collapsed_processes.remove(&pid);
-                        let _ = self.expanded_processes.insert(pid);
-                    }
-                    RowFold::Expanded => {
-                        let _ = self.expanded_processes.remove(&pid);
-                        let _ = self.collapsed_processes.insert(pid);
-                    }
-                }
+    fn mutate_current_fold(&mut self, mutation: FoldMutation) {
+        let target = match self.tab {
+            Tab::Processes => self
+                .process_rows
+                .selected()
+                .map(|row| (FoldTarget::Process(row.key), row.fold)),
+            Tab::Tmpfs => self
+                .tmpfs_rows
+                .selected()
+                .map(|row| (FoldTarget::Tmpfs(row.path.clone()), row.fold)),
+            Tab::Overview | Tab::Shared => None,
+        };
+        let Some((target, override_)) = target
+            .and_then(|(target, fold)| mutation.apply(fold).map(|override_| (target, override_)))
+        else {
+            return;
+        };
+        match target {
+            FoldTarget::Process(key) => {
+                let _ = self.process_folds.insert(key, override_);
                 self.rebuild_process_rows();
             }
-            Tab::Tmpfs => {
-                let Some((path, fold)) = self
-                    .tmpfs_rows
-                    .selected()
-                    .map(|row| (row.path.clone(), row.fold))
-                else {
-                    return;
-                };
-                match fold {
-                    RowFold::Leaf => return,
-                    RowFold::Collapsed => {
-                        let _ = self.collapsed_tmpfs.remove(&path);
-                        let _ = self.expanded_tmpfs.insert(path);
-                    }
-                    RowFold::Expanded => {
-                        let _ = self.expanded_tmpfs.remove(&path);
-                        let _ = self.collapsed_tmpfs.insert(path);
-                    }
-                }
+            FoldTarget::Tmpfs(path) => {
+                let _ = self.tmpfs_folds.insert(path, override_);
                 self.rebuild_tmpfs_rows();
             }
-            Tab::Overview | Tab::Shared => {}
         }
     }
 
@@ -1601,13 +1494,13 @@ impl App {
             return;
         };
 
-        if kind == TmpfsNodeKind::Mount {
+        let Ok(kind) = DeleteKind::try_from(kind) else {
             self.last_error = Some(format!(
                 "refusing to delete tmpfs mount root {}",
                 path.display()
             ));
             return;
-        }
+        };
 
         let Some(successor) = self.tmpfs_rows.selected_slot() else {
             return;
@@ -1622,13 +1515,14 @@ impl App {
         });
 
         self.last_error = None;
-        let _ = self.collapsed_tmpfs.remove(&path);
-        let _ = self.expanded_tmpfs.remove(&path);
-        self.deletions.push(DeleteTask {
-            path: path.clone(),
-            mount_point,
-            result,
-        });
+        let _ = self.tmpfs_folds.remove(&path);
+        let _ = self.deletions.insert(
+            path.clone(),
+            DeletionState::Running(DeleteTask {
+                mount_point,
+                result,
+            }),
+        );
         self.prune_tmpfs_path(&path);
         let _ = self.tmpfs_rows.select_clamped(successor);
     }
@@ -1644,20 +1538,20 @@ impl App {
         match ProcessKillTarget::capture(process) {
             Ok(target) => {
                 self.last_error = None;
-                self.kill_confirmation = Some(KillConfirmation::new(target));
+                self.modal = Some(Modal::Kill(KillConfirmation::new(target)));
             }
             Err(error) => self.last_error = Some(error),
         }
     }
 
-    fn confirm_process_kill(&mut self, commands: &Sender<WorkerCommand>) {
-        let Some(confirmation) = self.kill_confirmation.take() else {
+    fn confirm_process_kill(&mut self, commands: &WorkerPort) {
+        let Some(Modal::Kill(confirmation)) = self.modal.take() else {
             return;
         };
         match confirmation.target.send_sigterm() {
             Ok(()) => {
                 self.last_error = None;
-                let _ = commands.send(WorkerCommand::RefreshProcesses);
+                commands.refresh_processes();
             }
             Err(error) => self.last_error = Some(error),
         }
@@ -1672,17 +1566,10 @@ fn open_pidfd(pid: Pid) -> std::result::Result<OwnedFd, String> {
         .map_err(|error| format!("pidfd_open {pid}: {error}"))
 }
 
-fn delete_tmpfs_entry(path: &Path, kind: TmpfsNodeKind) -> std::io::Result<()> {
+fn delete_tmpfs_entry(path: &Path, kind: DeleteKind) -> std::io::Result<()> {
     let result = match kind {
-        TmpfsNodeKind::Directory => fs::remove_dir_all(path),
-        TmpfsNodeKind::Mount => Ok(()),
-        TmpfsNodeKind::File
-        | TmpfsNodeKind::Symlink
-        | TmpfsNodeKind::Socket
-        | TmpfsNodeKind::Fifo
-        | TmpfsNodeKind::CharDevice
-        | TmpfsNodeKind::BlockDevice
-        | TmpfsNodeKind::Other => fs::remove_file(path),
+        DeleteKind::Directory => fs::remove_dir_all(path),
+        DeleteKind::File => fs::remove_file(path),
     };
     match result {
         Ok(()) => Ok(()),
@@ -1754,20 +1641,11 @@ fn tmpfs_tree_contains_path(node: &TmpfsNode, path: &Path) -> bool {
                 .any(|child| tmpfs_tree_contains_path(child, path)))
 }
 
-fn empty_snapshot(meminfo: Meminfo) -> Snapshot {
-    let mut snapshot = Snapshot {
-        captured_at: SystemTime::now(),
-        elapsed: Duration::ZERO,
-        meminfo,
-        overview: super::model::Overview::default(),
-        process_tree: super::model::ProcessTree::default(),
-        shared_objects: Vec::new(),
-        sysv_segments: Vec::new(),
-        tmpfs_mounts: Vec::new(),
-        warnings: Vec::new(),
-    };
-    probe::rebuild_snapshot_derived(&mut snapshot);
-    snapshot
+fn tmpfs_allocated_total(mounts: &[TmpfsMount]) -> Bytes {
+    mounts
+        .iter()
+        .map(|mount| mount.root.allocated)
+        .fold(Bytes::ZERO, |total, allocated| total + allocated)
 }
 
 #[cfg(test)]

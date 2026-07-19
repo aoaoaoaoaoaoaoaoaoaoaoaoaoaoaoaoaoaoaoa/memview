@@ -1,4 +1,7 @@
-use super::super::model::{MemoryRollup, ProcessCwd, ProcessTree, ProcessTreeStats};
+use super::super::model::{
+    CaptureStamp, LedgerState, MemoryRollup, ProcessCwd, ProcessRecord, ProcessTree,
+    ProcessTreeStats,
+};
 use super::*;
 
 #[derive(Clone, Debug)]
@@ -55,36 +58,35 @@ fn tmpfs_dir(path: &str, allocated: Bytes, children: Vec<TmpfsNode>) -> TmpfsNod
     }
 }
 
-fn tmpfs_snapshot(mounts: Vec<TmpfsMount>) -> Snapshot {
-    Snapshot {
-        captured_at: SystemTime::UNIX_EPOCH,
-        elapsed: Duration::ZERO,
-        meminfo: Meminfo::default(),
-        overview: super::super::model::Overview::default(),
-        process_tree: ProcessTree::default(),
-        shared_objects: Vec::new(),
-        sysv_segments: Vec::new(),
-        tmpfs_mounts: mounts,
+fn ledger<T>(value: T) -> Ledger<T> {
+    Ledger {
+        stamp: CaptureStamp {
+            captured_at: SystemTime::UNIX_EPOCH,
+            elapsed: Duration::ZERO,
+        },
+        value,
         warnings: Vec::new(),
     }
 }
 
-fn process_snapshot(nodes: Vec<ProcessNode>) -> Snapshot {
-    Snapshot {
-        captured_at: SystemTime::UNIX_EPOCH,
-        elapsed: Duration::ZERO,
+fn tmpfs_ledger(mounts: Vec<TmpfsMount>) -> Ledger<Tmpfs> {
+    let allocated_total = tmpfs_allocated_total(&mounts);
+    ledger(Tmpfs {
+        mounts,
+        allocated_total,
+    })
+}
+
+fn process_ledger(nodes: Vec<ProcessNode>) -> Ledger<Processes> {
+    ledger(Processes {
         meminfo: Meminfo::default(),
-        overview: super::super::model::Overview::default(),
-        process_tree: ProcessTree {
+        tree: ProcessTree {
             roots: (0..nodes.len()).collect(),
             nodes,
             stats: ProcessTreeStats::default(),
         },
-        shared_objects: Vec::new(),
-        sysv_segments: Vec::new(),
-        tmpfs_mounts: Vec::new(),
-        warnings: Vec::new(),
-    }
+        totals: super::super::model::ProcessTotals::default(),
+    })
 }
 
 fn process_node(pid: i32, command: &str, cwd: Option<&str>) -> ProcessNode {
@@ -94,20 +96,23 @@ fn process_node(pid: i32, command: &str, cwd: Option<&str>) -> ProcessNode {
         ..MemoryRollup::default()
     };
     ProcessNode {
-        pid: Pid(pid),
-        ppid: None,
-        name: format!("p{pid}"),
-        command: command.to_string(),
-        cwd: cwd.map(|path| ProcessCwd::new(PathBuf::from(path))),
-        username: "test".to_string(),
-        state: "S".to_string(),
-        threads: 1,
-        rollup,
+        process: ProcessRecord {
+            pid: Pid(pid),
+            start_time_ticks: pid as u64,
+            ppid: None,
+            name: format!("p{pid}"),
+            command: command.to_string(),
+            cwd: cwd.map(|path| ProcessCwd::new(PathBuf::from(path))),
+            username: "test".to_string(),
+            state: "S".to_string(),
+            threads: 1,
+            rollup,
+            objects: Vec::new(),
+            rollup_state: LedgerState::Exact,
+            mappings_state: LedgerState::Deferred,
+        },
         subtree: rollup,
         children: Vec::new(),
-        objects: Vec::new(),
-        rollup_state: LedgerState::Exact,
-        mappings_state: LedgerState::Deferred,
     }
 }
 
@@ -117,9 +122,34 @@ fn regex(pattern: &str) -> Search {
         .expect("test regex is non-empty")
 }
 
-fn next_process_scan_switch(commands: &Receiver<WorkerCommand>) -> bool {
+#[test]
+fn shared_rows_obey_the_selected_metric() {
+    let object = |label: &str, pss: u64, rss: u64| SharedObject {
+        kind: ObjectKind::File,
+        label: label.to_string(),
+        rollup: MemoryRollup {
+            pss: Bytes(pss),
+            rss: Bytes(rss),
+            ..MemoryRollup::default()
+        },
+        regions: 1,
+        mapped_processes: 1,
+        consumers: Vec::new(),
+    };
+    let shared = Shared {
+        meminfo: Meminfo::default(),
+        objects: vec![object("pss", 20, 10), object("rss", 10, 20)],
+    };
+
+    let (pss, _) = build_shared_rows(&shared, Metric::Pss, None);
+    let (rss, _) = build_shared_rows(&shared, Metric::Rss, None);
+    assert_eq!(shared.objects[pss[0].index].label, "pss");
+    assert_eq!(shared.objects[rss[0].index].label, "rss");
+}
+
+fn next_process_scan_switch(commands: &Receiver<ProcessRequest>) -> bool {
     match commands.recv().expect("process scan switch command") {
-        WorkerCommand::SetProcessScanning(enabled) => enabled,
+        ProcessRequest::SetScanning(enabled) => enabled,
         command => unreachable!("expected process scan switch, got {command:?}"),
     }
 }
@@ -139,6 +169,7 @@ fn de_minimis_chooses_lower_threshold() {
 #[test]
 fn process_scanning_tracks_focus_and_active_tab() {
     let (commands, events) = mpsc::channel();
+    let commands = WorkerPort::process_harness(commands);
     let mut app = App::new();
 
     app.set_focused(false, &commands);
@@ -159,12 +190,10 @@ fn process_scanning_tracks_focus_and_active_tab() {
 
 #[test]
 fn fold_policy_respects_roots_leaves_and_manual_overrides() {
-    let collapsed = BTreeSet::new();
-    let mut expanded = BTreeSet::new();
-    let _ = expanded.insert(7);
+    let mut overrides = BTreeMap::new();
+    let _ = overrides.insert(7, FoldOverride::Expanded);
     let policy = FoldPolicy {
-        collapsed: &collapsed,
-        expanded: &expanded,
+        overrides: &overrides,
         de_minimis: DeMinimis {
             threshold: Bytes(100),
         },
@@ -179,7 +208,7 @@ fn fold_policy_respects_roots_leaves_and_manual_overrides() {
 #[test]
 fn process_search_matches_cwd() {
     let mut app = App::new();
-    app.snapshot = Some(process_snapshot(vec![process_node(
+    app.ledgers.processes = Some(process_ledger(vec![process_node(
         42,
         "rust-analyzer",
         Some("/home/main/programming/projects/memview"),
@@ -189,7 +218,7 @@ fn process_search_matches_cwd() {
     app.rebuild_process_rows();
 
     assert_eq!(app.process_rows().len(), 1);
-    assert_eq!(app.process_rows()[0].pid, Pid(42));
+    assert_eq!(app.process_rows()[0].key.pid, Pid(42));
 }
 
 #[test]
@@ -211,14 +240,14 @@ fn pane_rows_can_select_deleted_row_successor_slot() {
 #[test]
 fn tmpfs_background_rebuilds_stay_pinned_to_top_until_user_entry() {
     let mut app = App::new();
-    app.snapshot = Some(tmpfs_snapshot(vec![tmpfs_mount("/tmpfs-small", Bytes(1))]));
+    app.ledgers.tmpfs = Some(tmpfs_ledger(vec![tmpfs_mount("/tmpfs-small", Bytes(1))]));
     app.rebuild_tmpfs_rows();
     assert_eq!(
         app.tmpfs_rows.selected().map(|row| row.path.as_path()),
         Some(Path::new("/tmpfs-small"))
     );
 
-    app.snapshot = Some(tmpfs_snapshot(vec![
+    app.ledgers.tmpfs = Some(tmpfs_ledger(vec![
         tmpfs_mount("/tmpfs-big", Bytes(2)),
         tmpfs_mount("/tmpfs-small", Bytes(1)),
     ]));
@@ -232,9 +261,10 @@ fn tmpfs_background_rebuilds_stay_pinned_to_top_until_user_entry() {
 
 #[test]
 fn first_tmpfs_entry_seizes_top_then_preserves_user_anchor() {
-    let (commands, _events) = mpsc::channel();
+    let (processes, _requests) = mpsc::channel();
+    let commands = WorkerPort::process_harness(processes);
     let mut app = App::new();
-    app.snapshot = Some(tmpfs_snapshot(vec![
+    app.ledgers.tmpfs = Some(tmpfs_ledger(vec![
         tmpfs_mount("/tmpfs-big", Bytes(2)),
         tmpfs_mount("/tmpfs-small", Bytes(1)),
     ]));
@@ -244,7 +274,7 @@ fn first_tmpfs_entry_seizes_top_then_preserves_user_anchor() {
     app.select_tab(Tab::Tmpfs, &commands);
     assert_eq!(app.selected_tmpfs_row(), 0);
 
-    app.snapshot = Some(tmpfs_snapshot(vec![
+    app.ledgers.tmpfs = Some(tmpfs_ledger(vec![
         tmpfs_mount("/tmpfs-bigger", Bytes(3)),
         tmpfs_mount("/tmpfs-big", Bytes(2)),
         tmpfs_mount("/tmpfs-small", Bytes(1)),
@@ -260,7 +290,7 @@ fn first_tmpfs_entry_seizes_top_then_preserves_user_anchor() {
 fn optimistic_tmpfs_delete_prunes_immediately_and_keeps_successor_slot() {
     let mut app = App::new();
     app.tab = Tab::Tmpfs;
-    app.snapshot = Some(tmpfs_snapshot(vec![tmpfs_tree(
+    app.ledgers.tmpfs = Some(tmpfs_ledger(vec![tmpfs_tree(
         "/proc/self/memview-delete-test",
         Bytes(30),
         vec![
@@ -312,31 +342,70 @@ fn confirmed_tmpfs_tombstone_prunes_stale_scan_and_clears_after_absent_scan() {
     );
     let victim = PathBuf::from("/tmp/memview-tombstone-test/victim");
     let mut app = App::new();
-    app.snapshot = Some(tmpfs_snapshot(vec![stale.clone()]));
-    let _ = app.confirmed_deletions.insert(victim.clone());
+    app.ledgers.tmpfs = Some(tmpfs_ledger(vec![stale.clone()]));
+    let _ = app
+        .deletions
+        .insert(victim.clone(), DeletionState::Confirmed);
 
-    app.install_tmpfs_mount_scan(probe::TmpfsMountScan {
-        captured_at: SystemTime::UNIX_EPOCH,
-        elapsed: Duration::ZERO,
-        mount: stale,
-        warnings: Vec::new(),
-    });
+    app.install_tmpfs_mount(ledger(stale));
     assert!(!app.tmpfs_rows().iter().any(|row| row.path == victim));
-    assert!(app.confirmed_deletions.contains(&victim));
+    assert!(app.deletions.contains_key(&victim));
 
-    app.install_tmpfs_mount_scan(probe::TmpfsMountScan {
-        captured_at: SystemTime::UNIX_EPOCH,
-        elapsed: Duration::ZERO,
-        mount: fresh,
-        warnings: Vec::new(),
+    app.install_tmpfs_mount(ledger(fresh));
+    assert!(!app.deletions.contains_key(&victim));
+}
+
+#[test]
+fn deletion_receiver_transitions_are_total() {
+    let (processes, _requests) = mpsc::channel();
+    let commands = WorkerPort::process_harness(processes);
+    let mount_point = PathBuf::from("/tmp");
+
+    let deleted = PathBuf::from("/tmp/deleted");
+    let mut app = App::new();
+    let _ = app_deletion(&mut app, deleted.clone(), mount_point.clone(), {
+        let (sender, result) = mpsc::channel();
+        sender.send(DeleteOutcome::Deleted).expect("receiver lives");
+        result
     });
-    assert!(!app.confirmed_deletions.contains(&victim));
+    assert!(app.poll_deletion(&commands));
+    assert!(matches!(
+        app.deletions.get(&deleted),
+        Some(DeletionState::Confirmed)
+    ));
+
+    let disconnected = PathBuf::from("/tmp/disconnected");
+    let (sender, result) = mpsc::channel();
+    drop(sender);
+    let _ = app_deletion(&mut app, disconnected.clone(), mount_point, result);
+    assert!(app.poll_deletion(&commands));
+    assert!(!app.deletions.contains_key(&disconnected));
+    assert!(
+        app.last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("disconnected"))
+    );
+}
+
+fn app_deletion(
+    app: &mut App,
+    path: PathBuf,
+    mount_point: PathBuf,
+    result: Receiver<DeleteOutcome>,
+) -> Option<DeletionState> {
+    app.deletions.insert(
+        path,
+        DeletionState::Running(DeleteTask {
+            mount_point,
+            result,
+        }),
+    )
 }
 
 #[test]
 fn tmpfs_search_self_mode_filters_to_direct_matches_and_sums_them() {
     let mut app = App::new();
-    app.snapshot = Some(tmpfs_snapshot(vec![tmpfs_tree(
+    app.ledgers.tmpfs = Some(tmpfs_ledger(vec![tmpfs_tree(
         "/mnt",
         Bytes(35),
         vec![
@@ -362,8 +431,8 @@ fn tmpfs_search_self_mode_filters_to_direct_matches_and_sums_them() {
 #[test]
 fn tmpfs_search_self_and_children_includes_context_parents_without_counting_them() {
     let mut app = App::new();
-    app.process_scope = ProcessScope::SelfAndChildren;
-    app.snapshot = Some(tmpfs_snapshot(vec![tmpfs_tree(
+    app.tree_scope = TreeScope::SelfAndChildren;
+    app.ledgers.tmpfs = Some(tmpfs_ledger(vec![tmpfs_tree(
         "/mnt",
         Bytes(35),
         vec![
@@ -393,8 +462,8 @@ fn tmpfs_search_self_and_children_includes_context_parents_without_counting_them
 #[test]
 fn tmpfs_search_self_and_children_does_not_double_count_nested_matches() {
     let mut app = App::new();
-    app.process_scope = ProcessScope::SelfAndChildren;
-    app.snapshot = Some(tmpfs_snapshot(vec![tmpfs_tree(
+    app.tree_scope = TreeScope::SelfAndChildren;
+    app.ledgers.tmpfs = Some(tmpfs_ledger(vec![tmpfs_tree(
         "/batch-root",
         Bytes(30),
         vec![tmpfs_dir("/batch-root/batch-child", Bytes(10), Vec::new())],
@@ -415,7 +484,8 @@ fn page_rows_match_left_table_viewport_height() {
 
 #[test]
 fn page_keys_move_one_visible_pane() {
-    let (commands, _events) = mpsc::channel();
+    let (processes, _requests) = mpsc::channel();
+    let commands = WorkerPort::process_harness(processes);
     let mut app = App::new();
     app.tab = Tab::Tmpfs;
     app.set_terminal_height(12);

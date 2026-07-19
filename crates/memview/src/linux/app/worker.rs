@@ -1,219 +1,321 @@
-use super::super::model::{Pid, Snapshot};
+use super::super::model::{Inventory, Ledger, ProcessKey, Processes, Shared, TmpfsMount};
 use super::super::probe;
 use color_eyre::eyre::Result;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const MIN_WORKER_REFRESH: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
-pub enum WorkerCommand {
-    RefreshInventory,
-    RefreshProcesses,
-    RefreshProcessMappings(Pid),
-    RefreshSharedObjects,
-    RefreshTmpfsMounts,
+enum InventoryRequest {
+    Refresh,
+    RefreshTmpfs,
     RefreshTmpfsMount(PathBuf),
-    SetProcessScanning(bool),
     Shutdown,
+}
+
+#[derive(Clone, Debug)]
+pub enum ProcessRequest {
+    Refresh,
+    RefreshMappings(ProcessKey),
+    RefreshShared,
+    SetScanning(bool),
+    Shutdown,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkerPort {
+    inventory: Sender<InventoryRequest>,
+    processes: Sender<ProcessRequest>,
+}
+
+impl WorkerPort {
+    pub fn refresh_inventory(&self) {
+        let _ = self.inventory.send(InventoryRequest::Refresh);
+    }
+
+    pub fn refresh_processes(&self) {
+        let _ = self.processes.send(ProcessRequest::Refresh);
+    }
+
+    pub fn refresh_process_mappings(&self, key: ProcessKey) {
+        let _ = self.processes.send(ProcessRequest::RefreshMappings(key));
+    }
+
+    pub fn refresh_shared(&self) {
+        let _ = self.processes.send(ProcessRequest::RefreshShared);
+    }
+
+    pub fn refresh_tmpfs(&self) {
+        let _ = self.inventory.send(InventoryRequest::RefreshTmpfs);
+    }
+
+    pub fn refresh_tmpfs_mount(&self, path: PathBuf) {
+        let _ = self
+            .inventory
+            .send(InventoryRequest::RefreshTmpfsMount(path));
+    }
+
+    pub fn set_process_scanning(&self, active: bool) {
+        let _ = self.processes.send(ProcessRequest::SetScanning(active));
+    }
+
+    pub fn shutdown(&self) {
+        let _ = self.inventory.send(InventoryRequest::Shutdown);
+        let _ = self.processes.send(ProcessRequest::Shutdown);
+    }
+
+    #[cfg(test)]
+    pub fn process_harness(processes: Sender<ProcessRequest>) -> Self {
+        let (inventory, _requests) = mpsc::channel();
+        Self {
+            inventory,
+            processes,
+        }
+    }
 }
 
 #[derive(Debug)]
 pub enum WorkerEvent {
-    InventoryReady(Result<Box<Snapshot>>),
-    TmpfsMountReady(Result<Box<probe::TmpfsMountScan>>),
+    InventoryReady(Result<Box<Ledger<Inventory>>>),
+    TmpfsMountReady(Result<Box<Ledger<TmpfsMount>>>),
     ProcessesStarted(Instant),
-    ProcessesReady(Result<Box<probe::ProcessScan>>),
-    ProcessMappingsReady(Result<Box<probe::ProcessMappingScan>>),
+    ProcessesReady(Result<Box<Ledger<Processes>>>),
+    ProcessMappingsReady(ProcessKey, Result<Box<probe::ProcessMappingScan>>),
     SharedObjectsStarted(Instant),
-    SharedObjectsReady(Result<Box<probe::SharedObjectsScan>>),
+    SharedObjectsReady(Result<Box<Ledger<Shared>>>),
 }
 
-pub fn spawn_worker(refresh_every: Duration) -> (Sender<WorkerCommand>, Receiver<WorkerEvent>) {
-    let refresh_every = refresh_every.max(MIN_WORKER_REFRESH);
-    let (command_tx, command_rx) = mpsc::channel();
-    let (event_tx, event_rx) = mpsc::channel();
+pub fn spawn_worker(refresh_every: Duration) -> (WorkerPort, Receiver<WorkerEvent>) {
     let (inventory_tx, inventory_rx) = mpsc::channel();
     let (process_tx, process_rx) = mpsc::channel();
+    let (event_tx, event_rx) = mpsc::channel();
 
     spawn_inventory_worker(inventory_rx, event_tx.clone());
-    spawn_process_worker(refresh_every, process_rx, event_tx);
+    spawn_process_worker(refresh_every.max(MIN_WORKER_REFRESH), process_rx, event_tx);
 
-    let _handle = thread::spawn(move || {
-        while let Ok(command) = command_rx.recv() {
-            match command {
-                WorkerCommand::RefreshInventory
-                | WorkerCommand::RefreshTmpfsMounts
-                | WorkerCommand::RefreshTmpfsMount(_) => {
-                    let _ = inventory_tx.send(command);
-                }
-                WorkerCommand::RefreshProcesses
-                | WorkerCommand::RefreshProcessMappings(_)
-                | WorkerCommand::RefreshSharedObjects
-                | WorkerCommand::SetProcessScanning(_) => {
-                    let _ = process_tx.send(command);
-                }
-                WorkerCommand::Shutdown => {
-                    let _ = inventory_tx.send(WorkerCommand::Shutdown);
-                    let _ = process_tx.send(WorkerCommand::Shutdown);
-                    break;
-                }
-            }
-        }
-    });
-
-    (command_tx, event_rx)
+    (
+        WorkerPort {
+            inventory: inventory_tx,
+            processes: process_tx,
+        },
+        event_rx,
+    )
 }
 
-fn spawn_inventory_worker(command_rx: Receiver<WorkerCommand>, event_tx: Sender<WorkerEvent>) {
+fn spawn_inventory_worker(command_rx: Receiver<InventoryRequest>, event_tx: Sender<WorkerEvent>) {
     let _handle = thread::spawn(move || {
-        loop {
-            match command_rx.recv() {
-                Ok(WorkerCommand::RefreshInventory) => {
-                    if !publish_inventory_shell(&event_tx) || !publish_all_tmpfs_mounts(&event_tx) {
-                        break;
-                    }
+        while let Ok(command) = command_rx.recv() {
+            let live = match command {
+                InventoryRequest::Refresh => {
+                    publish_inventory(&event_tx) && publish_all_tmpfs_mounts(&event_tx)
                 }
-                Ok(WorkerCommand::RefreshTmpfsMounts) => {
-                    if !publish_all_tmpfs_mounts(&event_tx) {
-                        break;
-                    }
-                }
-                Ok(WorkerCommand::RefreshTmpfsMount(path)) => {
-                    if !publish_tmpfs_mount(&event_tx, &path) {
-                        break;
-                    }
-                }
-                Ok(
-                    WorkerCommand::RefreshProcesses
-                    | WorkerCommand::RefreshProcessMappings(_)
-                    | WorkerCommand::RefreshSharedObjects
-                    | WorkerCommand::SetProcessScanning(_),
-                ) => {}
-                Ok(WorkerCommand::Shutdown) | Err(_) => break,
+                InventoryRequest::RefreshTmpfs => publish_all_tmpfs_mounts(&event_tx),
+                InventoryRequest::RefreshTmpfsMount(path) => publish_tmpfs_mount(&event_tx, &path),
+                InventoryRequest::Shutdown => break,
+            };
+            if !live {
+                break;
             }
         }
     });
 }
 
 #[derive(Clone, Copy, Debug)]
-enum ProcessWorkerFlow {
-    Continue,
+enum ProcessJob {
+    Mappings(ProcessKey),
+    Shared,
+    Processes,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum Cadence {
+    #[default]
+    Paused,
+    Scanning,
+}
+
+impl Cadence {
+    fn active(self) -> bool {
+        self == Self::Scanning
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum DemandFlag {
+    #[default]
+    Idle,
+    Pending,
+}
+
+impl DemandFlag {
+    fn raise(&mut self) {
+        *self = Self::Pending;
+    }
+
+    fn take(&mut self) -> bool {
+        matches!(std::mem::take(self), Self::Pending)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum WorkerLife {
+    #[default]
+    Running,
     Shutdown,
 }
 
-fn collect_process_command(
-    command: WorkerCommand,
-    active: &mut bool,
-    scan_once: &mut bool,
-    mapping_request: &mut Option<Pid>,
-    shared_request: &mut bool,
-) -> ProcessWorkerFlow {
-    match command {
-        WorkerCommand::SetProcessScanning(next) => *active = next,
-        WorkerCommand::RefreshProcesses => *scan_once = true,
-        WorkerCommand::RefreshProcessMappings(pid) => *mapping_request = Some(pid),
-        WorkerCommand::RefreshSharedObjects => *shared_request = true,
-        WorkerCommand::RefreshInventory
-        | WorkerCommand::RefreshTmpfsMounts
-        | WorkerCommand::RefreshTmpfsMount(_) => {}
-        WorkerCommand::Shutdown => return ProcessWorkerFlow::Shutdown,
-    }
-    ProcessWorkerFlow::Continue
+#[derive(Debug, Default)]
+struct ProcessDemand {
+    cadence: Cadence,
+    summary: DemandFlag,
+    mappings: Option<ProcessKey>,
+    shared: DemandFlag,
+    life: WorkerLife,
 }
 
-fn drain_process_commands(
-    command_rx: &Receiver<WorkerCommand>,
-    active: &mut bool,
-    scan_once: &mut bool,
-    mapping_request: &mut Option<Pid>,
-    shared_request: &mut bool,
-) -> ProcessWorkerFlow {
-    while let Ok(command) = command_rx.try_recv() {
-        if matches!(
-            collect_process_command(command, active, scan_once, mapping_request, shared_request),
-            ProcessWorkerFlow::Shutdown
-        ) {
-            return ProcessWorkerFlow::Shutdown;
+impl ProcessDemand {
+    fn absorb(&mut self, request: ProcessRequest) {
+        match request {
+            ProcessRequest::Refresh => self.summary.raise(),
+            ProcessRequest::RefreshMappings(pid) => self.mappings = Some(pid),
+            ProcessRequest::RefreshShared => self.shared.raise(),
+            ProcessRequest::SetScanning(active) => {
+                if active && !self.cadence.active() {
+                    self.summary.raise();
+                }
+                self.cadence = if active {
+                    Cadence::Scanning
+                } else {
+                    Cadence::Paused
+                };
+            }
+            ProcessRequest::Shutdown => self.life = WorkerLife::Shutdown,
         }
     }
-    ProcessWorkerFlow::Continue
-}
 
-fn publish_process_mappings(event_tx: &Sender<WorkerEvent>, pid: Pid) -> ProcessWorkerFlow {
-    if event_tx
-        .send(WorkerEvent::ProcessMappingsReady(
-            probe::capture_process_mappings(pid).map(Box::new),
-        ))
-        .is_err()
-    {
-        ProcessWorkerFlow::Shutdown
-    } else {
-        ProcessWorkerFlow::Continue
-    }
-}
-
-fn publish_shared_objects(event_tx: &Sender<WorkerEvent>) -> ProcessWorkerFlow {
-    if event_tx
-        .send(WorkerEvent::SharedObjectsStarted(Instant::now()))
-        .is_err()
-    {
-        return ProcessWorkerFlow::Shutdown;
-    }
-    if event_tx
-        .send(WorkerEvent::SharedObjectsReady(
-            probe::capture_shared_objects().map(Box::new),
-        ))
-        .is_err()
-    {
-        ProcessWorkerFlow::Shutdown
-    } else {
-        ProcessWorkerFlow::Continue
+    fn pop(&mut self) -> Option<ProcessJob> {
+        if let Some(pid) = self.mappings.take() {
+            Some(ProcessJob::Mappings(pid))
+        } else if self.shared.take() {
+            Some(ProcessJob::Shared)
+        } else if self.summary.take() {
+            Some(ProcessJob::Processes)
+        } else {
+            None
+        }
     }
 }
 
-fn publish_processes(event_tx: &Sender<WorkerEvent>) -> ProcessWorkerFlow {
-    if event_tx
-        .send(WorkerEvent::ProcessesStarted(Instant::now()))
-        .is_err()
-    {
-        return ProcessWorkerFlow::Shutdown;
-    }
-    if event_tx
-        .send(WorkerEvent::ProcessesReady(
-            probe::capture_processes().map(Box::new),
-        ))
-        .is_err()
-    {
-        ProcessWorkerFlow::Shutdown
-    } else {
-        ProcessWorkerFlow::Continue
+fn absorb_wait(
+    demand: &mut ProcessDemand,
+    command_rx: &Receiver<ProcessRequest>,
+    deadline: Option<Instant>,
+) {
+    let request = match deadline {
+        None => {
+            if let Ok(request) = command_rx.recv() {
+                Some(request)
+            } else {
+                demand.life = WorkerLife::Shutdown;
+                None
+            }
+        }
+        Some(deadline) => {
+            match command_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(request) => Some(request),
+                Err(RecvTimeoutError::Timeout) => {
+                    demand.summary.raise();
+                    None
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    demand.life = WorkerLife::Shutdown;
+                    None
+                }
+            }
+        }
+    };
+    if let Some(request) = request {
+        demand.absorb(request);
+        while let Ok(request) = command_rx.try_recv() {
+            demand.absorb(request);
+        }
     }
 }
 
-fn wait_process_command(
-    command_rx: &Receiver<WorkerCommand>,
+fn publish_process_job(event_tx: &Sender<WorkerEvent>, job: ProcessJob) -> bool {
+    match job {
+        ProcessJob::Mappings(key) => event_tx
+            .send(WorkerEvent::ProcessMappingsReady(
+                key,
+                probe::capture_process_mappings(key).map(Box::new),
+            ))
+            .is_ok(),
+        ProcessJob::Shared => {
+            event_tx
+                .send(WorkerEvent::SharedObjectsStarted(Instant::now()))
+                .is_ok()
+                && event_tx
+                    .send(WorkerEvent::SharedObjectsReady(
+                        probe::capture_shared_objects().map(Box::new),
+                    ))
+                    .is_ok()
+        }
+        ProcessJob::Processes => {
+            event_tx
+                .send(WorkerEvent::ProcessesStarted(Instant::now()))
+                .is_ok()
+                && event_tx
+                    .send(WorkerEvent::ProcessesReady(
+                        probe::capture_processes().map(Box::new),
+                    ))
+                    .is_ok()
+        }
+    }
+}
+
+fn spawn_process_worker(
     refresh_every: Duration,
-    active: &mut bool,
-    scan_once: &mut bool,
-    mapping_request: &mut Option<Pid>,
-    shared_request: &mut bool,
-) -> ProcessWorkerFlow {
-    match command_rx.recv_timeout(refresh_every) {
-        Ok(command) => {
-            collect_process_command(command, active, scan_once, mapping_request, shared_request)
+    command_rx: Receiver<ProcessRequest>,
+    event_tx: Sender<WorkerEvent>,
+) {
+    let _handle = thread::spawn(move || {
+        let mut demand = ProcessDemand::default();
+        let mut deadline = None;
+
+        loop {
+            if demand.life == WorkerLife::Shutdown {
+                break;
+            }
+            if demand.cadence.active()
+                && deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                demand.summary.raise();
+                deadline = None;
+            }
+            if let Some(job) = demand.pop() {
+                if !publish_process_job(&event_tx, job) {
+                    break;
+                }
+                deadline = demand
+                    .cadence
+                    .active()
+                    .then(|| Instant::now() + refresh_every);
+                continue;
+            }
+
+            let wait_deadline = demand.cadence.active().then_some(deadline).flatten();
+            absorb_wait(&mut demand, &command_rx, wait_deadline);
         }
-        Err(mpsc::RecvTimeoutError::Timeout) => ProcessWorkerFlow::Continue,
-        Err(mpsc::RecvTimeoutError::Disconnected) => ProcessWorkerFlow::Shutdown,
-    }
+    });
 }
 
-fn publish_inventory_shell(event_tx: &Sender<WorkerEvent>) -> bool {
+fn publish_inventory(event_tx: &Sender<WorkerEvent>) -> bool {
     event_tx
         .send(WorkerEvent::InventoryReady(
-            probe::capture_inventory_shell().map(|capture| Box::new(capture.inventory_snapshot())),
+            probe::capture_inventory().map(Box::new),
         ))
         .is_ok()
 }
@@ -241,128 +343,62 @@ fn publish_tmpfs_mount(event_tx: &Sender<WorkerEvent>, path: &Path) -> bool {
         .is_ok()
 }
 
-fn spawn_process_worker(
-    refresh_every: Duration,
-    command_rx: Receiver<WorkerCommand>,
-    event_tx: Sender<WorkerEvent>,
-) {
-    let _handle = thread::spawn(move || {
-        let mut active = false;
-        let mut scan_once = false;
-        let mut mapping_request = None;
-        let mut shared_request = false;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        loop {
-            if !active && !scan_once && mapping_request.is_none() && !shared_request {
-                match command_rx.recv() {
-                    Ok(command) => {
-                        if matches!(
-                            collect_process_command(
-                                command,
-                                &mut active,
-                                &mut scan_once,
-                                &mut mapping_request,
-                                &mut shared_request,
-                            ),
-                            ProcessWorkerFlow::Shutdown
-                        ) {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
+    #[test]
+    fn demand_coalesces_and_prioritizes_explicit_work() {
+        let mut demand = ProcessDemand::default();
+        demand.absorb(ProcessRequest::Refresh);
+        demand.absorb(ProcessRequest::RefreshShared);
+        let first = ProcessKey {
+            pid: super::super::super::model::Pid(1),
+            start_time_ticks: 10,
+        };
+        let second = ProcessKey {
+            pid: super::super::super::model::Pid(2),
+            start_time_ticks: 20,
+        };
+        demand.absorb(ProcessRequest::RefreshMappings(first));
+        demand.absorb(ProcessRequest::RefreshMappings(second));
 
-            if matches!(
-                drain_process_commands(
-                    &command_rx,
-                    &mut active,
-                    &mut scan_once,
-                    &mut mapping_request,
-                    &mut shared_request,
-                ),
-                ProcessWorkerFlow::Shutdown
-            ) {
-                break;
-            }
+        assert!(matches!(demand.pop(), Some(ProcessJob::Mappings(key)) if key == second));
+        assert!(matches!(demand.pop(), Some(ProcessJob::Shared)));
+        assert!(matches!(demand.pop(), Some(ProcessJob::Processes)));
+        assert!(demand.pop().is_none());
+    }
 
-            if let Some(pid) = mapping_request.take() {
-                if matches!(
-                    publish_process_mappings(&event_tx, pid),
-                    ProcessWorkerFlow::Shutdown
-                ) {
-                    break;
-                }
-                if active
-                    && !scan_once
-                    && matches!(
-                        wait_process_command(
-                            &command_rx,
-                            refresh_every,
-                            &mut active,
-                            &mut scan_once,
-                            &mut mapping_request,
-                            &mut shared_request,
-                        ),
-                        ProcessWorkerFlow::Shutdown
-                    )
-                {
-                    break;
-                }
-                continue;
-            }
+    #[test]
+    fn enabling_periodic_scanning_demands_an_immediate_summary() {
+        let mut demand = ProcessDemand::default();
+        demand.absorb(ProcessRequest::SetScanning(true));
+        assert!(matches!(demand.pop(), Some(ProcessJob::Processes)));
+        demand.absorb(ProcessRequest::SetScanning(true));
+        assert!(demand.pop().is_none());
+    }
 
-            if shared_request {
-                shared_request = false;
-                if matches!(
-                    publish_shared_objects(&event_tx),
-                    ProcessWorkerFlow::Shutdown
-                ) {
-                    break;
-                }
-                if active
-                    && !scan_once
-                    && matches!(
-                        wait_process_command(
-                            &command_rx,
-                            refresh_every,
-                            &mut active,
-                            &mut scan_once,
-                            &mut mapping_request,
-                            &mut shared_request,
-                        ),
-                        ProcessWorkerFlow::Shutdown
-                    )
-                {
-                    break;
-                }
-                continue;
-            }
+    #[test]
+    fn shutdown_is_absorbing() {
+        let mut demand = ProcessDemand::default();
+        demand.absorb(ProcessRequest::Shutdown);
+        assert_eq!(demand.life, WorkerLife::Shutdown);
+    }
 
-            if !active && !scan_once {
-                continue;
-            }
-            scan_once = false;
-
-            if matches!(publish_processes(&event_tx), ProcessWorkerFlow::Shutdown) {
-                break;
-            }
-
-            if active
-                && matches!(
-                    wait_process_command(
-                        &command_rx,
-                        refresh_every,
-                        &mut active,
-                        &mut scan_once,
-                        &mut mapping_request,
-                        &mut shared_request,
-                    ),
-                    ProcessWorkerFlow::Shutdown
-                )
-            {
-                break;
-            }
-        }
-    });
+    #[test]
+    fn disconnected_timed_wait_shuts_down_instead_of_faking_a_tick() {
+        let (sender, receiver) = mpsc::channel();
+        drop(sender);
+        let mut demand = ProcessDemand {
+            cadence: Cadence::Scanning,
+            ..ProcessDemand::default()
+        };
+        absorb_wait(
+            &mut demand,
+            &receiver,
+            Some(Instant::now() + Duration::from_secs(1)),
+        );
+        assert_eq!(demand.life, WorkerLife::Shutdown);
+        assert!(demand.pop().is_none());
+    }
 }

@@ -1,7 +1,8 @@
 use super::model::{
-    Bytes, LedgerState, Meminfo, MeminfoEntry, MemoryRollup, Metric, ObjectConsumer, ObjectKind,
-    ObjectUsage, Overview, Pid, ProcessCwd, ProcessNode, ProcessTree, ProcessTreeStats,
-    SharedObject, Snapshot, SysvSegment, TmpfsMount, TmpfsNode, TmpfsNodeKind,
+    Bytes, CaptureStamp, Inventory, Ledger, LedgerState, Meminfo, MeminfoEntry, MemoryRollup,
+    Metric, ObjectConsumer, ObjectKind, ObjectUsage, Pid, ProcessCwd, ProcessKey, ProcessNode,
+    ProcessRecord, ProcessTotals, ProcessTree, ProcessTreeStats, Processes, Shared, SharedObject,
+    SysvSegment, TmpfsMount, TmpfsNode, TmpfsNodeKind,
 };
 use color_eyre::eyre::{Context, Result, eyre};
 use std::cmp::Reverse;
@@ -18,49 +19,11 @@ use walkdir::WalkDir;
 
 const DELETED_MAPPING_SUFFIX: &str = " (deleted)";
 
-pub struct Capture {
-    started: Instant,
-    meminfo: Meminfo,
-    tmpfs_mounts: Vec<TmpfsMount>,
-    sysv_segments: Vec<SysvSegment>,
-    warnings: Vec<String>,
-}
-
-impl Capture {
-    #[must_use]
-    pub fn inventory_snapshot(&self) -> Snapshot {
-        let process_tree = ProcessTree::default();
-        let shared_objects = fold_shared_objects(&process_tree, &self.sysv_segments);
-        let overview = derive_overview(&process_tree, &self.tmpfs_mounts, &self.sysv_segments);
-
-        Snapshot {
-            captured_at: SystemTime::now(),
-            elapsed: self.started.elapsed(),
-            meminfo: self.meminfo.clone(),
-            overview,
-            process_tree,
-            shared_objects,
-            sysv_segments: self.sysv_segments.clone(),
-            tmpfs_mounts: self.tmpfs_mounts.clone(),
-            warnings: self.warnings.clone(),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct ProcessScan {
-    pub captured_at: SystemTime,
-    pub elapsed: Duration,
-    pub meminfo: Meminfo,
-    pub process_tree: ProcessTree,
-    pub warnings: Vec<String>,
-}
-
 #[derive(Debug)]
 pub struct ProcessMappingScan {
     pub elapsed: Duration,
     pub cost: ProcessMappingCost,
-    pub pid: Pid,
+    pub key: ProcessKey,
     pub objects: Vec<ObjectUsage>,
     pub mappings_state: LedgerState,
     pub warnings: Vec<String>,
@@ -73,71 +36,61 @@ pub struct ProcessMappingCost {
     pub parse: Duration,
 }
 
-#[derive(Debug)]
-pub struct SharedObjectsScan {
-    pub captured_at: SystemTime,
-    pub elapsed: Duration,
-    pub meminfo: Meminfo,
-    pub shared_objects: Vec<SharedObject>,
-    pub warnings: Vec<String>,
-}
-
-#[derive(Debug)]
-pub struct TmpfsMountScan {
-    pub captured_at: SystemTime,
-    pub elapsed: Duration,
-    pub mount: TmpfsMount,
-    pub warnings: Vec<String>,
-}
-
-impl ProcessScan {
-    pub fn install(self, snapshot: &mut Snapshot) {
-        snapshot.captured_at = self.captured_at;
-        snapshot.elapsed = self.elapsed;
-        snapshot.meminfo = self.meminfo;
-        snapshot.process_tree = self.process_tree;
-        rebuild_snapshot_derived(snapshot);
-    }
-}
-
-pub fn capture_inventory_shell() -> Result<Capture> {
+pub fn capture_inventory() -> Result<Ledger<Inventory>> {
     let started = Instant::now();
     let mut warnings = Vec::new();
     let meminfo = read_meminfo().wrap_err("failed to read /proc/meminfo")?;
-    let _mount_index = MountIndex::read().wrap_err("failed to read /proc/self/mountinfo")?;
     let sysv_segments =
         read_sysv_segments(&mut warnings).wrap_err("failed to read /proc/sysvipc/shm")?;
+    let sysv_rss_total = sysv_segments
+        .iter()
+        .map(|segment| segment.rss)
+        .fold(Bytes::ZERO, |total, rss| total + rss);
 
-    Ok(Capture {
-        started,
-        meminfo,
-        tmpfs_mounts: Vec::new(),
-        sysv_segments,
+    Ok(Ledger {
+        stamp: CaptureStamp {
+            captured_at: SystemTime::now(),
+            elapsed: started.elapsed(),
+        },
+        value: Inventory {
+            meminfo,
+            sysv_segments,
+            sysv_rss_total,
+        },
         warnings,
     })
 }
 
-pub fn capture_processes() -> Result<ProcessScan> {
+pub fn capture_processes() -> Result<Ledger<Processes>> {
     let started = Instant::now();
     let mut warnings = Vec::new();
     let meminfo = read_meminfo().wrap_err("failed to read /proc/meminfo")?;
     let forest = scan_processes(&mut warnings).wrap_err("failed to scan /proc")?;
-    Ok(ProcessScan {
-        captured_at: SystemTime::now(),
-        elapsed: started.elapsed(),
-        meminfo,
-        process_tree: build_process_tree(forest.processes, forest.stats),
+    let tree = build_process_tree(forest.processes, forest.stats);
+    let totals = derive_process_totals(&tree);
+    Ok(Ledger {
+        stamp: CaptureStamp {
+            captured_at: SystemTime::now(),
+            elapsed: started.elapsed(),
+        },
+        value: Processes {
+            meminfo,
+            tree,
+            totals,
+        },
         warnings,
     })
 }
 
-pub fn capture_process_mappings(pid: Pid) -> Result<ProcessMappingScan> {
+pub fn capture_process_mappings(key: ProcessKey) -> Result<ProcessMappingScan> {
     let started = Instant::now();
     let mut warnings = Vec::new();
+    let pid = key.pid;
+    let root = PathBuf::from("/proc").join(pid.0.to_string());
+    verify_process_key(&root, key)?;
     let mount_started = Instant::now();
     let mount_index = MountIndex::read().wrap_err("failed to read /proc/self/mountinfo")?;
     let mount_index_elapsed = mount_started.elapsed();
-    let root = PathBuf::from("/proc").join(pid.0.to_string());
     let read_started = Instant::now();
     let (objects, mappings_state, read_elapsed, parse_elapsed) =
         match fs::read_to_string(root.join("smaps")) {
@@ -164,6 +117,7 @@ pub fn capture_process_mappings(pid: Pid) -> Result<ProcessMappingScan> {
                 )
             }
         };
+    verify_process_key(&root, key)?;
 
     Ok(ProcessMappingScan {
         elapsed: started.elapsed(),
@@ -172,14 +126,19 @@ pub fn capture_process_mappings(pid: Pid) -> Result<ProcessMappingScan> {
             read: read_elapsed,
             parse: parse_elapsed,
         },
-        pid,
+        key,
         objects,
         mappings_state,
         warnings,
     })
 }
 
-pub fn capture_shared_objects() -> Result<SharedObjectsScan> {
+pub fn verify_process_identity(expected: ProcessKey) -> Result<()> {
+    let root = PathBuf::from("/proc").join(expected.pid.0.to_string());
+    verify_process_key(&root, expected)
+}
+
+pub fn capture_shared_objects() -> Result<Ledger<Shared>> {
     let started = Instant::now();
     let mut warnings = Vec::new();
     let meminfo = read_meminfo().wrap_err("failed to read /proc/meminfo")?;
@@ -191,54 +150,44 @@ pub fn capture_shared_objects() -> Result<SharedObjectsScan> {
     let stats = process_stats(&processes);
     let process_tree = build_process_tree(processes, stats);
 
-    Ok(SharedObjectsScan {
-        captured_at: SystemTime::now(),
-        elapsed: started.elapsed(),
-        meminfo,
-        shared_objects: fold_shared_objects(&process_tree, &sysv_segments),
+    Ok(Ledger {
+        stamp: CaptureStamp {
+            captured_at: SystemTime::now(),
+            elapsed: started.elapsed(),
+        },
+        value: Shared {
+            meminfo,
+            objects: fold_shared_objects(&process_tree, &sysv_segments),
+        },
         warnings,
     })
 }
 
 pub fn tmpfs_mount_points() -> Result<Vec<PathBuf>> {
-    let mut warnings = Vec::new();
     let mount_index = MountIndex::read().wrap_err("failed to read /proc/self/mountinfo")?;
-    Ok(unique_tmpfs_infos(&mount_index, &mut warnings)
+    Ok(unique_tmpfs_infos(&mount_index)
         .into_iter()
         .map(|info| info.mount_point)
         .collect())
 }
 
-pub fn capture_tmpfs_mount(path: &Path) -> Result<TmpfsMountScan> {
+pub fn capture_tmpfs_mount(path: &Path) -> Result<Ledger<TmpfsMount>> {
     let started = Instant::now();
-    let mut warnings = Vec::new();
     let mount_index = MountIndex::read().wrap_err("failed to read /proc/self/mountinfo")?;
     let info = mount_index
         .match_tmpfs_mount(path)
         .cloned()
         .ok_or_else(|| eyre!("no tmpfs mount contains {}", path.display()))?;
-    let mount = scan_tmpfs_mount(&info).map_err(|error| {
-        warnings.push(format!(
-            "tmpfs scan skipped for {}: {error}",
-            info.mount_point.display()
-        ));
-        error
-    })?;
+    let mount = scan_tmpfs_mount(&info)?;
 
-    Ok(TmpfsMountScan {
-        captured_at: SystemTime::now(),
-        elapsed: started.elapsed(),
-        mount,
-        warnings,
+    Ok(Ledger {
+        stamp: CaptureStamp {
+            captured_at: SystemTime::now(),
+            elapsed: started.elapsed(),
+        },
+        value: mount,
+        warnings: Vec::new(),
     })
-}
-
-pub fn rebuild_snapshot_derived(snapshot: &mut Snapshot) {
-    snapshot.overview = derive_overview(
-        &snapshot.process_tree,
-        &snapshot.tmpfs_mounts,
-        &snapshot.sysv_segments,
-    );
 }
 
 #[derive(Clone, Debug)]
@@ -366,18 +315,15 @@ fn parse_meminfo(text: &str) -> Meminfo {
         .map(|entry| Bytes::from_kib(entry.number))
         .unwrap_or(Bytes::ZERO);
     let mut entries = Vec::new();
-    let mut table = BTreeMap::new();
-
     for entry in raw {
         let value = meminfo_value(entry.key, entry.number, entry.unit, hugepage_size);
         entries.push(MeminfoEntry {
             key: entry.key.to_string(),
             value,
         });
-        let _ = table.insert(entry.key.to_string(), value);
     }
 
-    Meminfo { entries, table }
+    Meminfo { entries }
 }
 
 fn meminfo_value(key: &str, number: u64, unit: Option<&str>, hugepage_size: Bytes) -> Bytes {
@@ -446,23 +392,7 @@ fn parse_column<T: std::str::FromStr>(
     fields.get(position)?.parse().ok()
 }
 
-#[derive(Clone, Debug)]
-struct ScannedProcess {
-    pid: Pid,
-    ppid: Option<Pid>,
-    name: String,
-    command: String,
-    cwd: Option<ProcessCwd>,
-    username: String,
-    state: String,
-    threads: u32,
-    rollup: MemoryRollup,
-    objects: Vec<ObjectUsage>,
-    rollup_state: LedgerState,
-    mappings_state: LedgerState,
-}
-
-fn scan_process_shells(warnings: &mut Vec<String>) -> Result<Vec<ScannedProcess>> {
+fn scan_process_shells(warnings: &mut Vec<String>) -> Result<Vec<ProcessRecord>> {
     let mut processes = Vec::new();
     let mut usernames = BTreeMap::new();
 
@@ -499,8 +429,20 @@ fn scan_processes(warnings: &mut Vec<String>) -> Result<ProcessForest> {
 fn scan_process_shell(
     pid: Pid,
     usernames: &mut BTreeMap<u32, String>,
-) -> Result<Option<ScannedProcess>> {
+) -> Result<Option<ProcessRecord>> {
     let root = PathBuf::from("/proc").join(pid.0.to_string());
+    let key = match read_process_key(&root, pid) {
+        Ok(key) => key,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
     let status_text = match fs::read_to_string(root.join("status")) {
         Ok(text) => text,
         Err(error)
@@ -533,8 +475,13 @@ fn scan_process_shell(
         Err(_) => (fallback_rollup, LedgerState::Approximate),
     };
 
-    Ok(Some(ScannedProcess {
+    if read_process_key(&root, pid)? != key {
+        return Ok(None);
+    }
+
+    Ok(Some(ProcessRecord {
         pid,
+        start_time_ticks: key.start_time_ticks,
         ppid: status.ppid,
         name: status.name,
         command,
@@ -551,37 +498,39 @@ fn scan_process_shell(
 
 #[derive(Clone, Debug)]
 struct ProcessForest {
-    processes: Vec<ScannedProcess>,
+    processes: Vec<ProcessRecord>,
     stats: ProcessTreeStats,
 }
 
-fn process_stats(processes: &[ScannedProcess]) -> ProcessTreeStats {
+fn process_stats(processes: &[ProcessRecord]) -> ProcessTreeStats {
     ProcessTreeStats {
         observed_processes: processes.len(),
-        inaccessible_rollups: processes
+        degraded_rollups: processes
             .iter()
-            .filter(|process| process.rollup_state.is_inaccessible())
+            .filter(|process| process.rollup_state.is_degraded())
             .count(),
-        inaccessible_maps: processes
+        degraded_maps: processes
             .iter()
-            .filter(|process| process.mappings_state.is_inaccessible())
+            .filter(|process| process.mappings_state.is_degraded())
             .count(),
     }
 }
 
-fn attach_all_mapping_ledgers(processes: &mut [ScannedProcess], mount_index: &MountIndex) {
+fn attach_all_mapping_ledgers(processes: &mut [ProcessRecord], mount_index: &MountIndex) {
     for process in processes.iter_mut() {
         if process.rollup.rss == Bytes::ZERO && process.rollup.pss == Bytes::ZERO {
             continue;
         }
-        match fs::read_to_string(
-            PathBuf::from("/proc")
-                .join(process.pid.0.to_string())
-                .join("smaps"),
-        ) {
+        let key = process.key();
+        let root = PathBuf::from("/proc").join(process.pid.0.to_string());
+        match fs::read_to_string(root.join("smaps")) {
             Ok(text) => {
-                process.objects = parse_smaps(&text, mount_index);
-                process.mappings_state = LedgerState::Exact;
+                if verify_process_key(&root, key).is_ok() {
+                    process.objects = parse_smaps(&text, mount_index);
+                    process.mappings_state = LedgerState::Exact;
+                } else {
+                    process.mappings_state = LedgerState::Inaccessible;
+                }
             }
             Err(_) => process.mappings_state = LedgerState::Inaccessible,
         }
@@ -662,6 +611,40 @@ fn parse_status_kib(value: &str) -> Option<Bytes> {
         .map(Bytes::from_kib)
 }
 
+fn read_process_key(root: &Path, pid: Pid) -> io::Result<ProcessKey> {
+    let stat = fs::read_to_string(root.join("stat"))?;
+    let start_time_ticks = parse_process_start_time(&stat).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("malformed {}", root.join("stat").display()),
+        )
+    })?;
+    Ok(ProcessKey {
+        pid,
+        start_time_ticks,
+    })
+}
+
+fn parse_process_start_time(stat: &str) -> Option<u64> {
+    stat.get(stat.rfind(')')? + 1..)?
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+fn verify_process_key(root: &Path, expected: ProcessKey) -> Result<()> {
+    let observed = read_process_key(root, expected.pid)
+        .wrap_err_with(|| format!("failed to identify process {}", expected.pid))?;
+    if observed == expected {
+        Ok(())
+    } else {
+        Err(eyre!(
+            "process identity changed: expected {expected}, observed {observed}"
+        ))
+    }
+}
+
 fn read_cmdline(root: &Path) -> Option<String> {
     let bytes = fs::read(root.join("cmdline")).ok()?;
     if bytes.is_empty() {
@@ -702,7 +685,7 @@ fn parse_rollup_kv(text: &str) -> MemoryRollup {
         let Some((key, value)) = parse_kib_value(line) else {
             continue;
         };
-        apply_rollup_field(&mut rollup, key, value);
+        rollup.apply_proc_field(key, value);
     }
 
     rollup
@@ -712,34 +695,6 @@ fn parse_kib_value(line: &str) -> Option<(&str, Bytes)> {
     let (key, rest) = line.split_once(':')?;
     let value = rest.split_whitespace().next()?.parse::<u64>().ok()?;
     Some((key.trim(), Bytes::from_kib(value)))
-}
-
-fn apply_rollup_field(rollup: &mut MemoryRollup, key: &str, value: Bytes) {
-    match key {
-        "Size" => rollup.size = value,
-        "Rss" => rollup.rss = value,
-        "Pss" => rollup.pss = value,
-        "Pss_Dirty" => rollup.pss_dirty = value,
-        "Pss_Anon" => rollup.pss_anon = value,
-        "Pss_File" => rollup.pss_file = value,
-        "Pss_Shmem" => rollup.pss_shmem = value,
-        "Shared_Clean" => rollup.shared_clean = value,
-        "Shared_Dirty" => rollup.shared_dirty = value,
-        "Private_Clean" => rollup.private_clean = value,
-        "Private_Dirty" => rollup.private_dirty = value,
-        "Referenced" => rollup.referenced = value,
-        "Anonymous" => rollup.anonymous = value,
-        "LazyFree" => rollup.lazy_free = value,
-        "AnonHugePages" => rollup.anon_huge_pages = value,
-        "ShmemPmdMapped" => rollup.shmem_pmd_mapped = value,
-        "FilePmdMapped" => rollup.file_pmd_mapped = value,
-        "Shared_Hugetlb" => rollup.shared_hugetlb = value,
-        "Private_Hugetlb" => rollup.private_hugetlb = value,
-        "Swap" => rollup.swap = value,
-        "SwapPss" => rollup.swap_pss = value,
-        "Locked" => rollup.locked = value,
-        _ => {}
-    }
 }
 
 fn parse_smaps(text: &str, mount_index: &MountIndex) -> Vec<ObjectUsage> {
@@ -759,7 +714,7 @@ fn parse_smaps(text: &str, mount_index: &MountIndex) -> Vec<ObjectUsage> {
         if let Some((key, value)) = parse_kib_value(line)
             && let Some(mapping) = current.as_mut()
         {
-            apply_rollup_field(&mut mapping.rollup, key, value);
+            mapping.rollup.apply_proc_field(key, value);
         }
     }
 
@@ -946,24 +901,16 @@ fn restore_deleted_suffix(raw: String, deleted: bool) -> String {
     }
 }
 
-fn build_process_tree(processes: Vec<ScannedProcess>, stats: ProcessTreeStats) -> ProcessTree {
+fn build_process_tree(processes: Vec<ProcessRecord>, stats: ProcessTreeStats) -> ProcessTree {
     let mut nodes = processes
         .into_iter()
-        .map(|process| ProcessNode {
-            pid: process.pid,
-            ppid: process.ppid,
-            name: process.name,
-            command: process.command,
-            cwd: process.cwd,
-            username: process.username,
-            state: process.state,
-            threads: process.threads,
-            rollup: process.rollup,
-            subtree: process.rollup,
-            children: Vec::new(),
-            objects: process.objects,
-            rollup_state: process.rollup_state,
-            mappings_state: process.mappings_state,
+        .map(|process| {
+            let subtree = process.rollup;
+            ProcessNode {
+                process,
+                subtree,
+                children: Vec::new(),
+            }
         })
         .collect::<Vec<_>>();
 
@@ -1091,39 +1038,28 @@ fn fold_shared_objects(
     rows
 }
 
-fn derive_overview(
-    process_tree: &ProcessTree,
-    tmpfs_mounts: &[TmpfsMount],
-    sysv_segments: &[SysvSegment],
-) -> Overview {
-    let mut overview = Overview {
+fn derive_process_totals(process_tree: &ProcessTree) -> ProcessTotals {
+    let mut totals = ProcessTotals {
         process_count: process_tree.stats.observed_processes,
-        inaccessible_rollups: process_tree.stats.inaccessible_rollups,
-        inaccessible_maps: process_tree.stats.inaccessible_maps,
-        ..Overview::default()
+        degraded_rollups: process_tree.stats.degraded_rollups,
+        degraded_maps: process_tree.stats.degraded_maps,
+        ..ProcessTotals::default()
     };
 
     for node in &process_tree.nodes {
-        overview.process_pss_total += node.rollup.pss;
-        overview.process_uss_total += node.rollup.uss();
-        overview.process_rss_total += node.rollup.rss;
-        overview.process_swap_pss_total += node.rollup.swap_pss;
-        overview.process_pss_anon_total += node.rollup.pss_anon;
-        overview.process_pss_file_total += node.rollup.pss_file;
-        overview.process_pss_shmem_total += node.rollup.pss_shmem;
+        totals.pss += node.rollup.pss;
+        totals.uss += node.rollup.uss();
+        totals.rss += node.rollup.rss;
+        totals.swap_pss += node.rollup.swap_pss;
+        totals.pss_anon += node.rollup.pss_anon;
+        totals.pss_file += node.rollup.pss_file;
+        totals.pss_shmem += node.rollup.pss_shmem;
     }
 
-    for mount in tmpfs_mounts {
-        overview.tmpfs_allocated_total += mount.root.allocated;
-    }
-    for segment in sysv_segments {
-        overview.sysv_rss_total += segment.rss;
-    }
-
-    overview
+    totals
 }
 
-fn unique_tmpfs_infos(mount_index: &MountIndex, warnings: &mut Vec<String>) -> Vec<MountInfo> {
+fn unique_tmpfs_infos(mount_index: &MountIndex) -> Vec<MountInfo> {
     let mut infos = mount_index.tmpfs.iter().collect::<Vec<_>>();
     let mut seen_devices = BTreeSet::new();
     let mut unique = Vec::new();
@@ -1133,13 +1069,7 @@ fn unique_tmpfs_infos(mount_index: &MountIndex, warnings: &mut Vec<String>) -> V
         match fs::symlink_metadata(&info.mount_point) {
             Ok(metadata) if seen_devices.insert(metadata.dev()) => {}
             Ok(_) => continue,
-            Err(error) => {
-                warnings.push(format!(
-                    "tmpfs scan skipped for {}: {error}",
-                    info.mount_point.display()
-                ));
-                continue;
-            }
+            Err(_) => continue,
         }
 
         unique.push(info.clone());
@@ -1248,7 +1178,7 @@ fn scan_tmpfs_mount(info: &MountInfo) -> Result<TmpfsMount> {
         }
     }
 
-    let root = materialize_tmpfs_node(&info.mount_point, &mut nodes);
+    let root = materialize_tmpfs_node(&info.mount_point, &mut nodes)?;
     Ok(TmpfsMount {
         mount_point: info.mount_point.clone(),
         source: info.source.clone(),
@@ -1257,37 +1187,33 @@ fn scan_tmpfs_mount(info: &MountInfo) -> Result<TmpfsMount> {
     })
 }
 
-fn materialize_tmpfs_node(path: &Path, nodes: &mut BTreeMap<PathBuf, TmpfsBuilder>) -> TmpfsNode {
-    let builder = nodes.remove(path).unwrap_or_else(|| TmpfsBuilder {
-        path: path.to_path_buf(),
-        name: basename(path),
-        kind: TmpfsNodeKind::Other,
-        own_allocated: Bytes::ZERO,
-        own_logical: Bytes::ZERO,
-        allocated: Bytes::ZERO,
-        logical: Bytes::ZERO,
-        children: Vec::new(),
-    });
+fn materialize_tmpfs_node(
+    path: &Path,
+    nodes: &mut BTreeMap<PathBuf, TmpfsBuilder>,
+) -> Result<TmpfsNode> {
+    let builder = nodes
+        .remove(path)
+        .ok_or_else(|| eyre!("tmpfs tree lost indexed node {}", path.display()))?;
 
     let mut children = builder
         .children
         .iter()
         .map(|child| materialize_tmpfs_node(child, nodes))
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     children.sort_by(|lhs, rhs| {
         rhs.allocated
             .cmp(&lhs.allocated)
             .then_with(|| lhs.path.cmp(&rhs.path))
     });
 
-    TmpfsNode {
+    Ok(TmpfsNode {
         path: builder.path,
         name: builder.name,
         kind: builder.kind,
         allocated: builder.allocated,
         logical: builder.logical,
         children,
-    }
+    })
 }
 
 fn basename(path: &Path) -> String {
@@ -1356,9 +1282,17 @@ fn parse_size_option(value: &str) -> Option<Bytes> {
 mod tests {
     use super::*;
 
-    fn scanned_process(pid: i32, pss: u64) -> ScannedProcess {
-        ScannedProcess {
+    #[test]
+    fn parses_process_identity_after_parenthesized_command() {
+        let stat = "123 (worker ) with spaces) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242";
+        assert_eq!(parse_process_start_time(stat), Some(4242));
+        assert_eq!(parse_process_start_time("123 malformed"), None);
+    }
+
+    fn scanned_process(pid: i32, pss: u64) -> ProcessRecord {
+        ProcessRecord {
             pid: Pid(pid),
+            start_time_ticks: pid as u64,
             ppid: None,
             name: format!("p{pid}"),
             command: format!("p{pid} --serve"),
@@ -1386,8 +1320,8 @@ mod tests {
         ];
         let stats = process_stats(&processes);
         assert_eq!(stats.observed_processes, 3);
-        assert_eq!(stats.inaccessible_rollups, 0);
-        assert_eq!(stats.inaccessible_maps, 0);
+        assert_eq!(stats.degraded_rollups, 0);
+        assert_eq!(stats.degraded_maps, 0);
     }
 
     #[test]

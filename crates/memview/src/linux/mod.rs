@@ -5,7 +5,7 @@ mod probe;
 mod search;
 mod ui;
 
-use app::{App, WorkerCommand, spawn_worker};
+use app::{App, spawn_worker};
 use clap::Parser;
 use color_eyre::eyre::Result;
 use crossterm::cursor::{Hide, Show};
@@ -96,7 +96,7 @@ pub fn run() -> MainResult {
         }
     }
 
-    let _ = commands.send(WorkerCommand::Shutdown);
+    commands.shutdown();
     Ok(())
 }
 
@@ -113,11 +113,15 @@ fn poll_timeout(app: &App, next_animated_redraw: Instant) -> Duration {
 
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+    _restore: TerminalState,
 }
+
+struct TerminalState;
 
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
+        let restore = TerminalState;
         let mut stdout = io::stdout();
         execute!(
             stdout,
@@ -128,7 +132,10 @@ impl TerminalGuard {
         )?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
-        Ok(Self { terminal })
+        Ok(Self {
+            terminal,
+            _restore: restore,
+        })
     }
 
     fn draw<F>(&mut self, draw: F) -> Result<()>
@@ -144,16 +151,15 @@ impl TerminalGuard {
     }
 }
 
-impl Drop for TerminalGuard {
+impl Drop for TerminalState {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
         let _ = execute!(
-            self.terminal.backend_mut(),
+            io::stdout(),
             Show,
             DisableFocusChange,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
-        let _ = self.terminal.show_cursor();
+        let _ = disable_raw_mode();
     }
 }

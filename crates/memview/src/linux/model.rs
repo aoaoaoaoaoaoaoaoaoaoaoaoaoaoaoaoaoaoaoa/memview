@@ -1,7 +1,6 @@
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
-use std::ops::{Add, AddAssign, Sub, SubAssign};
+use std::ops::{Add, AddAssign, Deref, Sub, SubAssign};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -11,6 +10,18 @@ pub struct Pid(pub i32);
 impl Display for Pid {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         Display::fmt(&self.0, f)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProcessKey {
+    pub pid: Pid,
+    pub start_time_ticks: u64,
+}
+
+impl Display for ProcessKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{}", self.pid, self.start_time_ticks)
     }
 }
 
@@ -101,57 +112,62 @@ impl Display for Bytes {
     }
 }
 
-macro_rules! memory_rollup_apply {
-    ($lhs:expr, $rhs:expr, $op:tt) => {{
-        $lhs.size $op $rhs.size;
-        $lhs.rss $op $rhs.rss;
-        $lhs.pss $op $rhs.pss;
-        $lhs.pss_dirty $op $rhs.pss_dirty;
-        $lhs.pss_anon $op $rhs.pss_anon;
-        $lhs.pss_file $op $rhs.pss_file;
-        $lhs.pss_shmem $op $rhs.pss_shmem;
-        $lhs.shared_clean $op $rhs.shared_clean;
-        $lhs.shared_dirty $op $rhs.shared_dirty;
-        $lhs.private_clean $op $rhs.private_clean;
-        $lhs.private_dirty $op $rhs.private_dirty;
-        $lhs.referenced $op $rhs.referenced;
-        $lhs.anonymous $op $rhs.anonymous;
-        $lhs.lazy_free $op $rhs.lazy_free;
-        $lhs.anon_huge_pages $op $rhs.anon_huge_pages;
-        $lhs.shmem_pmd_mapped $op $rhs.shmem_pmd_mapped;
-        $lhs.file_pmd_mapped $op $rhs.file_pmd_mapped;
-        $lhs.shared_hugetlb $op $rhs.shared_hugetlb;
-        $lhs.private_hugetlb $op $rhs.private_hugetlb;
-        $lhs.swap $op $rhs.swap;
-        $lhs.swap_pss $op $rhs.swap_pss;
-        $lhs.locked $op $rhs.locked;
-    }};
+macro_rules! memory_rollup {
+    ($($field:ident => $proc_key:literal),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, Default)]
+        pub struct MemoryRollup {
+            $(pub $field: Bytes,)+
+        }
+
+        impl MemoryRollup {
+            pub(crate) fn apply_proc_field(&mut self, key: &str, value: Bytes) {
+                match key {
+                    $($proc_key => self.$field = value,)+
+                    _ => {}
+                }
+            }
+        }
+
+        impl Add for MemoryRollup {
+            type Output = Self;
+
+            fn add(mut self, rhs: Self) -> Self::Output {
+                self += rhs;
+                self
+            }
+        }
+
+        impl AddAssign for MemoryRollup {
+            fn add_assign(&mut self, rhs: Self) {
+                $(self.$field += rhs.$field;)+
+            }
+        }
+    };
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct MemoryRollup {
-    pub size: Bytes,
-    pub rss: Bytes,
-    pub pss: Bytes,
-    pub pss_dirty: Bytes,
-    pub pss_anon: Bytes,
-    pub pss_file: Bytes,
-    pub pss_shmem: Bytes,
-    pub shared_clean: Bytes,
-    pub shared_dirty: Bytes,
-    pub private_clean: Bytes,
-    pub private_dirty: Bytes,
-    pub referenced: Bytes,
-    pub anonymous: Bytes,
-    pub lazy_free: Bytes,
-    pub anon_huge_pages: Bytes,
-    pub shmem_pmd_mapped: Bytes,
-    pub file_pmd_mapped: Bytes,
-    pub shared_hugetlb: Bytes,
-    pub private_hugetlb: Bytes,
-    pub swap: Bytes,
-    pub swap_pss: Bytes,
-    pub locked: Bytes,
+memory_rollup! {
+    size => "Size",
+    rss => "Rss",
+    pss => "Pss",
+    pss_dirty => "Pss_Dirty",
+    pss_anon => "Pss_Anon",
+    pss_file => "Pss_File",
+    pss_shmem => "Pss_Shmem",
+    shared_clean => "Shared_Clean",
+    shared_dirty => "Shared_Dirty",
+    private_clean => "Private_Clean",
+    private_dirty => "Private_Dirty",
+    referenced => "Referenced",
+    anonymous => "Anonymous",
+    lazy_free => "LazyFree",
+    anon_huge_pages => "AnonHugePages",
+    shmem_pmd_mapped => "ShmemPmdMapped",
+    file_pmd_mapped => "FilePmdMapped",
+    shared_hugetlb => "Shared_Hugetlb",
+    private_hugetlb => "Private_Hugetlb",
+    swap => "Swap",
+    swap_pss => "SwapPss",
+    locked => "Locked",
 }
 
 impl MemoryRollup {
@@ -179,21 +195,6 @@ impl MemoryRollup {
     }
 }
 
-impl Add for MemoryRollup {
-    type Output = Self;
-
-    fn add(mut self, rhs: Self) -> Self::Output {
-        self += rhs;
-        self
-    }
-}
-
-impl AddAssign for MemoryRollup {
-    fn add_assign(&mut self, rhs: Self) {
-        memory_rollup_apply!(self, rhs, +=);
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct MeminfoEntry {
     pub key: String,
@@ -203,13 +204,15 @@ pub struct MeminfoEntry {
 #[derive(Clone, Debug, Default)]
 pub struct Meminfo {
     pub entries: Vec<MeminfoEntry>,
-    pub table: BTreeMap<String, Bytes>,
 }
 
 impl Meminfo {
     #[must_use]
     pub fn get(&self, key: &str) -> Bytes {
-        self.table.get(key).copied().unwrap_or(Bytes::ZERO)
+        self.entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .map_or(Bytes::ZERO, |entry| entry.value)
     }
 }
 
@@ -295,7 +298,7 @@ impl LedgerState {
     }
 
     #[must_use]
-    pub fn is_inaccessible(self) -> bool {
+    pub fn is_degraded(self) -> bool {
         matches!(self, Self::Approximate | Self::Inaccessible)
     }
 }
@@ -303,13 +306,14 @@ impl LedgerState {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ProcessTreeStats {
     pub observed_processes: usize,
-    pub inaccessible_rollups: usize,
-    pub inaccessible_maps: usize,
+    pub degraded_rollups: usize,
+    pub degraded_maps: usize,
 }
 
 #[derive(Clone, Debug)]
-pub struct ProcessNode {
+pub struct ProcessRecord {
     pub pid: Pid,
+    pub start_time_ticks: u64,
     pub ppid: Option<Pid>,
     pub name: String,
     pub command: String,
@@ -318,11 +322,34 @@ pub struct ProcessNode {
     pub state: String,
     pub threads: u32,
     pub rollup: MemoryRollup,
-    pub subtree: MemoryRollup,
-    pub children: Vec<usize>,
     pub objects: Vec<ObjectUsage>,
     pub rollup_state: LedgerState,
     pub mappings_state: LedgerState,
+}
+
+impl ProcessRecord {
+    #[must_use]
+    pub fn key(&self) -> ProcessKey {
+        ProcessKey {
+            pid: self.pid,
+            start_time_ticks: self.start_time_ticks,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProcessNode {
+    pub process: ProcessRecord,
+    pub subtree: MemoryRollup,
+    pub children: Vec<usize>,
+}
+
+impl Deref for ProcessNode {
+    type Target = ProcessRecord;
+
+    fn deref(&self) -> &Self::Target {
+        &self.process
+    }
 }
 
 impl ProcessNode {
@@ -473,30 +500,54 @@ impl Metric {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct Overview {
+pub struct ProcessTotals {
     pub process_count: usize,
-    pub inaccessible_rollups: usize,
-    pub inaccessible_maps: usize,
-    pub process_pss_total: Bytes,
-    pub process_uss_total: Bytes,
-    pub process_rss_total: Bytes,
-    pub process_swap_pss_total: Bytes,
-    pub process_pss_anon_total: Bytes,
-    pub process_pss_file_total: Bytes,
-    pub process_pss_shmem_total: Bytes,
-    pub tmpfs_allocated_total: Bytes,
+    pub degraded_rollups: usize,
+    pub degraded_maps: usize,
+    pub pss: Bytes,
+    pub uss: Bytes,
+    pub rss: Bytes,
+    pub swap_pss: Bytes,
+    pub pss_anon: Bytes,
+    pub pss_file: Bytes,
+    pub pss_shmem: Bytes,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CaptureStamp {
+    pub captured_at: SystemTime,
+    pub elapsed: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct Ledger<T> {
+    pub stamp: CaptureStamp,
+    pub value: T,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Inventory {
+    pub meminfo: Meminfo,
+    pub sysv_segments: Vec<SysvSegment>,
     pub sysv_rss_total: Bytes,
 }
 
 #[derive(Clone, Debug)]
-pub struct Snapshot {
-    pub captured_at: SystemTime,
-    pub elapsed: Duration,
+pub struct Processes {
     pub meminfo: Meminfo,
-    pub overview: Overview,
-    pub process_tree: ProcessTree,
-    pub shared_objects: Vec<SharedObject>,
-    pub sysv_segments: Vec<SysvSegment>,
-    pub tmpfs_mounts: Vec<TmpfsMount>,
-    pub warnings: Vec<String>,
+    pub tree: ProcessTree,
+    pub totals: ProcessTotals,
+}
+
+#[derive(Clone, Debug)]
+pub struct Tmpfs {
+    pub mounts: Vec<TmpfsMount>,
+    pub allocated_total: Bytes,
+}
+
+#[derive(Clone, Debug)]
+pub struct Shared {
+    pub meminfo: Meminfo,
+    pub objects: Vec<SharedObject>,
 }

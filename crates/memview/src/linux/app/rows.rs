@@ -1,488 +1,447 @@
 use super::*;
+use std::cmp::Ordering;
 
 pub(super) fn build_process_rows(
-    snapshot: &Snapshot,
+    processes: &Processes,
     metric: Metric,
-    scope: ProcessScope,
-    collapsed: &BTreeSet<Pid>,
-    expanded: &BTreeSet<Pid>,
+    scope: TreeScope,
+    overrides: &BTreeMap<ProcessKey, FoldOverride>,
     search: Option<&Search>,
 ) -> (Vec<FlatProcessRow>, SearchSummary) {
-    let mut summary = SearchSummary::new(metric.label());
-    let mut rows = Vec::new();
-    let roots = sorted_process_roots(snapshot, metric, scope);
-    if let Some(search) = search {
-        match scope {
-            ProcessScope::SelfOnly => {
-                for root in roots {
-                    push_process_search_self(
-                        root,
-                        0,
-                        snapshot,
-                        metric,
-                        search,
-                        &mut rows,
-                        &mut summary,
-                    );
-                }
-            }
-            ProcessScope::SelfAndChildren => {
-                for root in roots {
-                    let _ = push_process_search_tree(
-                        root,
-                        0,
-                        snapshot,
-                        metric,
-                        search,
-                        false,
-                        &mut rows,
-                        &mut summary,
-                    );
-                }
-            }
-        }
-        return (rows, summary);
-    }
-
-    let policy = FoldPolicy {
-        collapsed,
-        expanded,
-        de_minimis: DeMinimis::from_largest_non_root(
-            snapshot.meminfo.get("MemTotal"),
-            largest_process_non_root_subtree(snapshot, metric),
-        ),
-    };
-    for root in roots {
-        push_process_rows(root, 0, snapshot, metric, scope, &policy, &mut rows);
-    }
-    (rows, summary)
+    build_forest_rows(
+        &ProcessForest {
+            processes,
+            metric,
+            scope,
+        },
+        scope,
+        overrides,
+        search,
+    )
 }
 
 pub(super) fn build_tmpfs_rows(
-    snapshot: &Snapshot,
-    scope: ProcessScope,
-    collapsed: &BTreeSet<PathBuf>,
-    expanded: &BTreeSet<PathBuf>,
+    tmpfs: &Tmpfs,
+    system_total: Bytes,
+    scope: TreeScope,
+    overrides: &BTreeMap<PathBuf, FoldOverride>,
     search: Option<&Search>,
 ) -> (Vec<FlatTmpfsRow>, SearchSummary) {
-    let mut summary = SearchSummary::new("allocated");
-    let mut rows = Vec::new();
-    if let Some(search) = search {
-        match scope {
-            ProcessScope::SelfOnly => {
-                for (mount_index, mount) in snapshot.tmpfs_mounts.iter().enumerate() {
-                    push_tmpfs_search_self(
-                        mount_index,
-                        &mount.root,
-                        0,
-                        search,
-                        &mut rows,
-                        &mut summary,
-                    );
-                }
-            }
-            ProcessScope::SelfAndChildren => {
-                for (mount_index, mount) in snapshot.tmpfs_mounts.iter().enumerate() {
-                    let _ = push_tmpfs_search_tree(
-                        mount_index,
-                        &mount.root,
-                        0,
-                        search,
-                        false,
-                        &mut rows,
-                        &mut summary,
-                    );
-                }
-            }
-        }
-        return (rows, summary);
-    }
-
-    let policy = FoldPolicy {
-        collapsed,
-        expanded,
-        de_minimis: DeMinimis::from_largest_non_root(
-            snapshot.meminfo.get("MemTotal"),
-            largest_tmpfs_non_root_subtree(snapshot),
-        ),
-    };
-    for (mount_index, mount) in snapshot.tmpfs_mounts.iter().enumerate() {
-        push_tmpfs_rows(mount_index, &mount.root, 0, &policy, &mut rows);
-    }
-    (rows, summary)
+    build_forest_rows(
+        &TmpfsForest {
+            tmpfs,
+            system_total,
+        },
+        scope,
+        overrides,
+        search,
+    )
 }
 
 pub(super) fn build_shared_rows(
-    snapshot: &Snapshot,
+    shared: &Shared,
     metric: Metric,
     search: Option<&Search>,
 ) -> (Vec<FlatSharedRow>, SearchSummary) {
     let mut summary = SearchSummary::new(metric.label());
-    let rows = snapshot
-        .shared_objects
+    let mut indices = shared
+        .objects
         .iter()
         .enumerate()
         .filter_map(|(index, object)| {
-            let direct = search.is_none_or(|search| shared_matches(search, object));
-            if !direct {
-                return None;
-            }
+            search
+                .is_none_or(|search| shared_matches(search, object))
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    indices.sort_by(|lhs, rhs| {
+        let lhs = &shared.objects[*lhs];
+        let rhs = &shared.objects[*rhs];
+        metric
+            .cmp_rollup(lhs.rollup, rhs.rollup)
+            .then_with(|| lhs.kind.cmp(&rhs.kind))
+            .then_with(|| lhs.label.cmp(&rhs.label))
+    });
+    let rows = indices
+        .into_iter()
+        .map(|index| {
+            let object = &shared.objects[index];
             if search.is_some() {
                 summary.strike(object.rollup.metric(metric));
             }
-            Some(FlatSharedRow {
+            FlatSharedRow {
                 index,
                 key: (object.kind, object.label.clone()),
                 search: search.map_or(SearchRole::Ordinary, |_| SearchRole::Match),
-            })
+            }
         })
         .collect();
     (rows, summary)
 }
 
-fn sorted_process_roots(snapshot: &Snapshot, metric: Metric, scope: ProcessScope) -> Vec<usize> {
-    let mut roots = snapshot.process_tree.roots.clone();
-    roots.sort_by(|lhs, rhs| {
-        process_cmp(
-            &snapshot.process_tree.nodes[*lhs],
-            &snapshot.process_tree.nodes[*rhs],
-            metric,
-            scope,
-        )
-    });
-    roots
+trait Forest {
+    type Handle: Copy;
+    type Key: Clone + Ord;
+    type Row;
+
+    fn roots(&self) -> Vec<Self::Handle>;
+    fn children(&self, handle: Self::Handle) -> Vec<Self::Handle>;
+    fn key(&self, handle: Self::Handle) -> Self::Key;
+    fn direct_value(&self, handle: Self::Handle) -> Bytes;
+    fn total_value(&self, handle: Self::Handle) -> Bytes;
+    fn matches(&self, search: &Search, handle: Self::Handle) -> bool;
+    fn row(
+        &self,
+        handle: Self::Handle,
+        depth: usize,
+        fold: RowFold,
+        search: SearchRole,
+    ) -> Self::Row;
+    fn system_total(&self) -> Bytes;
+    fn summary_label(&self) -> &'static str;
 }
 
-fn largest_process_non_root_subtree(snapshot: &Snapshot, metric: Metric) -> Bytes {
-    snapshot
-        .process_tree
-        .roots
-        .iter()
-        .flat_map(|root| snapshot.process_tree.nodes[*root].children.iter().copied())
-        .map(|child| largest_process_subtree(child, snapshot, metric))
+fn build_forest_rows<F: Forest>(
+    forest: &F,
+    scope: TreeScope,
+    overrides: &BTreeMap<F::Key, FoldOverride>,
+    search: Option<&Search>,
+) -> (Vec<F::Row>, SearchSummary) {
+    let mut rows = Vec::new();
+    let mut summary = SearchSummary::new(forest.summary_label());
+    if let Some(search) = search {
+        for root in forest.roots() {
+            match scope {
+                TreeScope::SelfOnly => {
+                    push_direct_matches(forest, root, 0, search, &mut rows, &mut summary);
+                }
+                TreeScope::SelfAndChildren => {
+                    let _ = push_contextual_matches(
+                        forest,
+                        root,
+                        0,
+                        search,
+                        false,
+                        &mut rows,
+                        &mut summary,
+                    );
+                }
+            }
+        }
+        return (rows, summary);
+    }
+
+    let policy = FoldPolicy {
+        overrides,
+        de_minimis: DeMinimis::from_largest_non_root(
+            forest.system_total(),
+            largest_non_root_subtree(forest),
+        ),
+    };
+    for root in forest.roots() {
+        push_browse_rows(forest, root, 0, &policy, &mut rows);
+    }
+    (rows, summary)
+}
+
+fn push_browse_rows<F: Forest>(
+    forest: &F,
+    handle: F::Handle,
+    depth: usize,
+    policy: &FoldPolicy<'_, F::Key>,
+    rows: &mut Vec<F::Row>,
+) {
+    let children = forest.children(handle);
+    let fold = policy.row_fold(
+        &forest.key(handle),
+        depth,
+        !children.is_empty(),
+        forest.total_value(handle),
+    );
+    rows.push(forest.row(handle, depth, fold, SearchRole::Ordinary));
+    if fold.is_collapsed() {
+        return;
+    }
+    for child in children {
+        push_browse_rows(forest, child, depth + 1, policy, rows);
+    }
+}
+
+fn push_direct_matches<F: Forest>(
+    forest: &F,
+    handle: F::Handle,
+    depth: usize,
+    search: &Search,
+    rows: &mut Vec<F::Row>,
+    summary: &mut SearchSummary,
+) {
+    if forest.matches(search, handle) {
+        summary.strike(forest.direct_value(handle));
+        rows.push(forest.row(handle, depth, RowFold::Leaf, SearchRole::Match));
+    }
+    for child in forest.children(handle) {
+        push_direct_matches(forest, child, depth + 1, search, rows, summary);
+    }
+}
+
+fn push_contextual_matches<F: Forest>(
+    forest: &F,
+    handle: F::Handle,
+    depth: usize,
+    search: &Search,
+    covered_by_match: bool,
+    rows: &mut Vec<F::Row>,
+    summary: &mut SearchSummary,
+) -> bool {
+    let direct = forest.matches(search, handle);
+    let mut child_rows = Vec::new();
+    let mut child_visible = false;
+    for child in forest.children(handle) {
+        child_visible |= push_contextual_matches(
+            forest,
+            child,
+            depth + 1,
+            search,
+            covered_by_match || direct,
+            &mut child_rows,
+            summary,
+        );
+    }
+    if direct {
+        summary.hit();
+        if !covered_by_match {
+            summary.attribute(forest.total_value(handle));
+        }
+    }
+    let visible = direct || child_visible;
+    if visible {
+        rows.push(forest.row(
+            handle,
+            depth,
+            if child_visible {
+                RowFold::Expanded
+            } else {
+                RowFold::Leaf
+            },
+            if direct {
+                SearchRole::Match
+            } else {
+                SearchRole::Context
+            },
+        ));
+        rows.extend(child_rows);
+    }
+    visible
+}
+
+fn largest_non_root_subtree<F: Forest>(forest: &F) -> Bytes {
+    forest
+        .roots()
+        .into_iter()
+        .flat_map(|root| forest.children(root))
+        .map(|child| largest_subtree(forest, child))
         .max()
         .unwrap_or(Bytes::ZERO)
 }
 
-fn largest_process_subtree(index: usize, snapshot: &Snapshot, metric: Metric) -> Bytes {
-    let node = &snapshot.process_tree.nodes[index];
-    let child_max = node
-        .children
+fn largest_subtree<F: Forest>(forest: &F, handle: F::Handle) -> Bytes {
+    let children = forest.children(handle);
+    let child_max = children
         .iter()
         .copied()
-        .map(|child| largest_process_subtree(child, snapshot, metric))
+        .map(|child| largest_subtree(forest, child))
         .max()
         .unwrap_or(Bytes::ZERO);
-    if node.children.is_empty() {
+    if children.is_empty() {
         child_max
     } else {
-        child_max.max(node.subtree.metric(metric))
+        child_max.max(forest.total_value(handle))
     }
 }
 
-fn push_process_rows(
-    index: usize,
-    depth: usize,
-    snapshot: &Snapshot,
+struct ProcessForest<'a> {
+    processes: &'a Processes,
     metric: Metric,
-    scope: ProcessScope,
-    policy: &FoldPolicy<'_, Pid>,
-    rows: &mut Vec<FlatProcessRow>,
-) {
-    let node = &snapshot.process_tree.nodes[index];
-    let fold = policy.row_fold(
-        &node.pid,
-        depth,
-        !node.children.is_empty(),
-        node.subtree.metric(metric),
-    );
-    rows.push(FlatProcessRow {
-        index,
-        pid: node.pid,
-        depth,
-        fold,
-        search: SearchRole::Ordinary,
-    });
-    if fold.is_collapsed() {
-        return;
+    scope: TreeScope,
+}
+
+impl ProcessForest<'_> {
+    fn node(&self, index: usize) -> &ProcessNode {
+        &self.processes.tree.nodes[index]
     }
 
-    for child in sorted_process_children(node, snapshot, metric, scope) {
-        push_process_rows(child, depth + 1, snapshot, metric, scope, policy, rows);
+    fn sort(&self, indices: &mut [usize]) {
+        indices.sort_by(|lhs, rhs| self.compare(self.node(*lhs), self.node(*rhs)));
+    }
+
+    fn compare(&self, lhs: &ProcessNode, rhs: &ProcessNode) -> Ordering {
+        self.metric
+            .cmp_rollup(self.scope.rollup(lhs), self.scope.rollup(rhs))
+            .then_with(|| lhs.pid.cmp(&rhs.pid))
     }
 }
 
-fn sorted_process_children(
-    node: &ProcessNode,
-    snapshot: &Snapshot,
-    metric: Metric,
-    scope: ProcessScope,
-) -> Vec<usize> {
-    let mut children = node.children.clone();
-    children.sort_by(|lhs, rhs| {
-        process_cmp(
-            &snapshot.process_tree.nodes[*lhs],
-            &snapshot.process_tree.nodes[*rhs],
-            metric,
-            scope,
-        )
-    });
-    children
-}
+impl Forest for ProcessForest<'_> {
+    type Handle = usize;
+    type Key = ProcessKey;
+    type Row = FlatProcessRow;
 
-fn push_process_search_self(
-    index: usize,
-    depth: usize,
-    snapshot: &Snapshot,
-    metric: Metric,
-    search: &Search,
-    rows: &mut Vec<FlatProcessRow>,
-    summary: &mut SearchSummary,
-) {
-    let node = &snapshot.process_tree.nodes[index];
-    if process_matches(search, node) {
-        summary.strike(node.rollup.metric(metric));
-        rows.push(FlatProcessRow {
-            index,
-            pid: node.pid,
+    fn roots(&self) -> Vec<Self::Handle> {
+        let mut roots = self.processes.tree.roots.clone();
+        self.sort(&mut roots);
+        roots
+    }
+
+    fn children(&self, handle: Self::Handle) -> Vec<Self::Handle> {
+        let mut children = self.node(handle).children.clone();
+        self.sort(&mut children);
+        children
+    }
+
+    fn key(&self, handle: Self::Handle) -> Self::Key {
+        self.node(handle).key()
+    }
+
+    fn direct_value(&self, handle: Self::Handle) -> Bytes {
+        self.node(handle).rollup.metric(self.metric)
+    }
+
+    fn total_value(&self, handle: Self::Handle) -> Bytes {
+        self.node(handle).subtree.metric(self.metric)
+    }
+
+    fn matches(&self, search: &Search, handle: Self::Handle) -> bool {
+        let node = self.node(handle);
+        search.matches(&node.name)
+            || search.matches(&node.command)
+            || node
+                .cwd
+                .as_ref()
+                .is_some_and(|cwd| search.matches(cwd.as_str()))
+            || search.matches(&node.username)
+            || search.matches(&node.state)
+            || search.matches(&node.pid.to_string())
+    }
+
+    fn row(
+        &self,
+        handle: Self::Handle,
+        depth: usize,
+        fold: RowFold,
+        search: SearchRole,
+    ) -> Self::Row {
+        FlatProcessRow {
+            index: handle,
+            key: self.node(handle).key(),
             depth,
-            fold: RowFold::Leaf,
-            search: SearchRole::Match,
-        });
-    }
-    for child in sorted_process_children(node, snapshot, metric, ProcessScope::SelfOnly) {
-        push_process_search_self(child, depth + 1, snapshot, metric, search, rows, summary);
-    }
-}
-
-fn push_process_search_tree(
-    index: usize,
-    depth: usize,
-    snapshot: &Snapshot,
-    metric: Metric,
-    search: &Search,
-    covered_by_match: bool,
-    rows: &mut Vec<FlatProcessRow>,
-    summary: &mut SearchSummary,
-) -> bool {
-    let node = &snapshot.process_tree.nodes[index];
-    let direct = process_matches(search, node);
-    let mut child_rows = Vec::new();
-    let mut child_visible = false;
-    let children = sorted_process_children(node, snapshot, metric, ProcessScope::SelfAndChildren);
-    for child in children {
-        child_visible |= push_process_search_tree(
-            child,
-            depth + 1,
-            snapshot,
-            metric,
+            fold,
             search,
-            covered_by_match || direct,
-            &mut child_rows,
-            summary,
-        );
-    }
-    if direct {
-        summary.hit();
-        if !covered_by_match {
-            summary.attribute(node.subtree.metric(metric));
         }
     }
-    let visible = direct || child_visible;
-    if visible {
-        rows.push(FlatProcessRow {
-            index,
-            pid: node.pid,
-            depth,
-            fold: if child_visible {
-                RowFold::Expanded
-            } else {
-                RowFold::Leaf
-            },
-            search: if direct {
-                SearchRole::Match
-            } else {
-                SearchRole::Context
-            },
+
+    fn system_total(&self) -> Bytes {
+        self.processes.meminfo.get("MemTotal")
+    }
+
+    fn summary_label(&self) -> &'static str {
+        self.metric.label()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TmpfsHandle<'a> {
+    mount_index: usize,
+    node: &'a TmpfsNode,
+}
+
+struct TmpfsForest<'a> {
+    tmpfs: &'a Tmpfs,
+    system_total: Bytes,
+}
+
+impl<'a> Forest for TmpfsForest<'a> {
+    type Handle = TmpfsHandle<'a>;
+    type Key = PathBuf;
+    type Row = FlatTmpfsRow;
+
+    fn roots(&self) -> Vec<Self::Handle> {
+        self.tmpfs
+            .mounts
+            .iter()
+            .enumerate()
+            .map(|(mount_index, mount)| TmpfsHandle {
+                mount_index,
+                node: &mount.root,
+            })
+            .collect()
+    }
+
+    fn children(&self, handle: Self::Handle) -> Vec<Self::Handle> {
+        let mut children = handle
+            .node
+            .children
+            .iter()
+            .map(|node| TmpfsHandle {
+                mount_index: handle.mount_index,
+                node,
+            })
+            .collect::<Vec<_>>();
+        children.sort_by(|lhs, rhs| {
+            rhs.node
+                .allocated
+                .cmp(&lhs.node.allocated)
+                .then_with(|| lhs.node.path.cmp(&rhs.node.path))
         });
-        rows.extend(child_rows);
-    }
-    visible
-}
-
-fn process_matches(search: &Search, node: &ProcessNode) -> bool {
-    search.matches(&node.name)
-        || search.matches(&node.command)
-        || node
-            .cwd
-            .as_ref()
-            .is_some_and(|cwd| search.matches(cwd.as_str()))
-        || search.matches(&node.username)
-        || search.matches(&node.state)
-        || search.matches(&node.pid.to_string())
-}
-
-fn largest_tmpfs_non_root_subtree(snapshot: &Snapshot) -> Bytes {
-    snapshot
-        .tmpfs_mounts
-        .iter()
-        .flat_map(|mount| mount.root.children.iter())
-        .map(largest_tmpfs_subtree)
-        .max()
-        .unwrap_or(Bytes::ZERO)
-}
-
-fn largest_tmpfs_subtree(node: &TmpfsNode) -> Bytes {
-    let child_max = node
-        .children
-        .iter()
-        .map(largest_tmpfs_subtree)
-        .max()
-        .unwrap_or(Bytes::ZERO);
-    if node.children.is_empty() {
-        child_max
-    } else {
-        child_max.max(node.allocated)
-    }
-}
-
-fn push_tmpfs_rows(
-    mount_index: usize,
-    node: &TmpfsNode,
-    depth: usize,
-    policy: &FoldPolicy<'_, PathBuf>,
-    rows: &mut Vec<FlatTmpfsRow>,
-) {
-    let fold = policy.row_fold(&node.path, depth, !node.children.is_empty(), node.allocated);
-    rows.push(FlatTmpfsRow {
-        mount_index,
-        path: node.path.clone(),
-        name: node.name.clone(),
-        kind: node.kind,
-        allocated: node.allocated,
-        logical: node.logical,
-        depth,
-        fold,
-        search: SearchRole::Ordinary,
-    });
-    if fold.is_collapsed() {
-        return;
+        children
     }
 
-    for child in sorted_tmpfs_children(node) {
-        push_tmpfs_rows(mount_index, child, depth + 1, policy, rows);
+    fn key(&self, handle: Self::Handle) -> Self::Key {
+        handle.node.path.clone()
     }
-}
 
-fn push_tmpfs_search_self(
-    mount_index: usize,
-    node: &TmpfsNode,
-    depth: usize,
-    search: &Search,
-    rows: &mut Vec<FlatTmpfsRow>,
-    summary: &mut SearchSummary,
-) {
-    if tmpfs_matches(search, node) {
-        summary.strike(node.allocated);
-        rows.push(FlatTmpfsRow {
-            mount_index,
-            path: node.path.clone(),
-            name: node.name.clone(),
-            kind: node.kind,
-            allocated: node.allocated,
-            logical: node.logical,
+    fn direct_value(&self, handle: Self::Handle) -> Bytes {
+        handle.node.allocated
+    }
+
+    fn total_value(&self, handle: Self::Handle) -> Bytes {
+        handle.node.allocated
+    }
+
+    fn matches(&self, search: &Search, handle: Self::Handle) -> bool {
+        search.matches(&handle.node.name)
+            || search.matches(handle.node.kind.label())
+            || search.matches(handle.node.path.to_string_lossy().as_ref())
+    }
+
+    fn row(
+        &self,
+        handle: Self::Handle,
+        depth: usize,
+        fold: RowFold,
+        search: SearchRole,
+    ) -> Self::Row {
+        FlatTmpfsRow {
+            mount_index: handle.mount_index,
+            path: handle.node.path.clone(),
+            name: handle.node.name.clone(),
+            kind: handle.node.kind,
+            allocated: handle.node.allocated,
+            logical: handle.node.logical,
             depth,
-            fold: RowFold::Leaf,
-            search: SearchRole::Match,
-        });
-    }
-    for child in sorted_tmpfs_children(node) {
-        push_tmpfs_search_self(mount_index, child, depth + 1, search, rows, summary);
-    }
-}
-
-fn push_tmpfs_search_tree(
-    mount_index: usize,
-    node: &TmpfsNode,
-    depth: usize,
-    search: &Search,
-    covered_by_match: bool,
-    rows: &mut Vec<FlatTmpfsRow>,
-    summary: &mut SearchSummary,
-) -> bool {
-    let direct = tmpfs_matches(search, node);
-    let mut child_rows = Vec::new();
-    let mut child_visible = false;
-    for child in sorted_tmpfs_children(node) {
-        child_visible |= push_tmpfs_search_tree(
-            mount_index,
-            child,
-            depth + 1,
+            fold,
             search,
-            covered_by_match || direct,
-            &mut child_rows,
-            summary,
-        );
-    }
-    if direct {
-        summary.hit();
-        if !covered_by_match {
-            summary.attribute(node.allocated);
         }
     }
-    let visible = direct || child_visible;
-    if visible {
-        rows.push(FlatTmpfsRow {
-            mount_index,
-            path: node.path.clone(),
-            name: node.name.clone(),
-            kind: node.kind,
-            allocated: node.allocated,
-            logical: node.logical,
-            depth,
-            fold: if child_visible {
-                RowFold::Expanded
-            } else {
-                RowFold::Leaf
-            },
-            search: if direct {
-                SearchRole::Match
-            } else {
-                SearchRole::Context
-            },
-        });
-        rows.extend(child_rows);
+
+    fn system_total(&self) -> Bytes {
+        self.system_total
     }
-    visible
-}
 
-fn sorted_tmpfs_children(node: &TmpfsNode) -> Vec<&'_ TmpfsNode> {
-    let mut children = node.children.iter().collect::<Vec<_>>();
-    children.sort_by(|lhs, rhs| {
-        rhs.allocated
-            .cmp(&lhs.allocated)
-            .then_with(|| lhs.path.cmp(&rhs.path))
-    });
-    children
-}
-
-fn tmpfs_matches(search: &Search, node: &TmpfsNode) -> bool {
-    search.matches(&node.name)
-        || search.matches(node.kind.label())
-        || search.matches(node.path.to_string_lossy().as_ref())
+    fn summary_label(&self) -> &'static str {
+        "allocated"
+    }
 }
 
 fn shared_matches(search: &Search, object: &SharedObject) -> bool {
     search.matches(&object.label) || search.matches(object.kind.label())
-}
-
-fn process_cmp(
-    lhs: &ProcessNode,
-    rhs: &ProcessNode,
-    metric: Metric,
-    scope: ProcessScope,
-) -> std::cmp::Ordering {
-    metric
-        .cmp_rollup(scope.rollup(lhs), scope.rollup(rhs))
-        .then_with(|| lhs.pid.cmp(&rhs.pid))
 }
