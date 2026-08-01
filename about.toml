@@ -1,0 +1,17 @@
+# The release notice is generated from Cargo.lock with cargo-about.
+accepted = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+]
+targets = ["x86_64-unknown-linux-gnu"]
+ignore-build-dependencies = false
+ignore-dev-dependencies = false
+ignore-transitive-dependencies = false
+workarounds = ["rustix"]
