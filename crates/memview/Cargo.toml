@@ -16,7 +16,7 @@ color-eyre = "0.6.5"
 crossterm = "0.29.0"
 ratatui = { version = "0.30.0", default-features = false, features = ["crossterm"] }
 regex = "1.12.2"
-rustix = { version = "1.1.4", features = ["process"] }
+rustix = { version = "1.1.4", features = ["param", "process"] }
 uzers = "0.12.2"
 walkdir = "2.5.0"
 

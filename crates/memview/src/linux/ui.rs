@@ -1,6 +1,7 @@
 use super::app::{App, Binding, FlatProcessRow, FlatSharedRow, FlatTmpfsRow, RowFold};
 use super::model::{
-    Bytes, Meminfo, MeminfoEntry, ObjectUsage, Pid, ProcessTotals, Processes, Shared, TmpfsMount,
+    Bytes, Meminfo, MeminfoEntry, NvidiaPoolLedger, ObjectUsage, Pid, ProcessTotals, Processes,
+    Shared, TmpfsMount,
 };
 use super::nav::FooterHint;
 use super::search::SearchRole;
@@ -124,12 +125,6 @@ fn footer(app: &App) -> Paragraph<'static> {
         spans.push(Span::styled("  last error: ", Style::default().fg(HOT)));
         spans.push(Span::styled(error.clone(), Style::default().fg(HOT)));
     }
-    if app.deletion_count() > 0 {
-        spans.push(Span::styled(
-            format!("  deleting {} in background", app.deletion_count()),
-            Style::default().fg(HOT),
-        ));
-    }
     if let Some(confirmation) = app.kill_confirmation() {
         if confirmation.armed() {
             spans.push(Span::styled(
@@ -202,7 +197,11 @@ fn render_overview(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .split(area);
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(11), Constraint::Min(8)])
+        .constraints([
+            Constraint::Length(13),
+            Constraint::Length(12),
+            Constraint::Min(6),
+        ])
         .split(columns[1]);
 
     let mem_rows = meminfo
@@ -223,6 +222,61 @@ fn render_overview(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .block(panel("meminfo"))
         .column_spacing(1),
         columns[0],
+    );
+
+    let physical = meminfo.physical_ledger();
+    let mut physical_rows = vec![
+        accounting_row("Allocated RAM", physical.allocated, physical.total),
+        accounting_row("LRU pages", physical.lru, physical.total),
+        accounting_row("Slab", physical.slab, physical.total),
+        accounting_row("HugeTLB", physical.hugetlb, physical.total),
+        accounting_row("Kernel counters", physical.kernel, physical.total),
+    ];
+    match app.inventory().and_then(|inventory| inventory.nvidia_pools) {
+        Some(NvidiaPoolLedger::Exact(snapshot)) => {
+            physical_rows.push(accounting_row(
+                &format!("NVIDIA pools ({})", snapshot.pool_count),
+                snapshot.bytes,
+                physical.total,
+            ));
+            physical_rows.push(accounting_row(
+                "Other direct / unknown",
+                physical.direct - snapshot.bytes,
+                physical.total,
+            ));
+        }
+        Some(NvidiaPoolLedger::Disabled) => {
+            physical_rows.push(accounting_row(
+                "Direct / unclassified",
+                physical.direct,
+                physical.total,
+            ));
+            physical_rows.push(summary_text_row("NVIDIA sysmem pools", "disabled"));
+        }
+        Some(NvidiaPoolLedger::Inaccessible) => {
+            physical_rows.push(accounting_row(
+                "Direct / unclassified",
+                physical.direct,
+                physical.total,
+            ));
+            physical_rows.push(summary_text_row("NVIDIA sysmem pools", "inaccessible"));
+        }
+        None => physical_rows.push(accounting_row(
+            "Direct / unclassified",
+            physical.direct,
+            physical.total,
+        )),
+    }
+    physical_rows.push(accounting_row("Free RAM", physical.free, physical.total));
+    frame.render_widget(
+        Table::new(
+            physical_rows,
+            [Constraint::Length(24), Constraint::Length(16)],
+        )
+        .header(header_row(["Physical ledger", "Value"]))
+        .block(panel("RAM reconciliation"))
+        .column_spacing(1),
+        right[0],
     );
 
     let process_totals = app
@@ -247,17 +301,6 @@ fn render_overview(frame: &mut Frame<'_>, app: &App, area: Rect) {
         summary_row("Σ process PSS shmem", process_totals.pss_shmem),
         summary_row("Σ tmpfs allocated", tmpfs_allocated),
         summary_row("Σ SysV shm RSS", sysv_rss),
-        summary_text_row("processes", &process_totals.process_count.to_string()),
-        summary_text_row("SysV segments", &sysv_segments.to_string()),
-        summary_text_row(
-            "scan millis",
-            &app.last_capture_elapsed().as_millis().to_string(),
-        ),
-        summary_text_row(
-            "degraded rollups",
-            &process_totals.degraded_rollups.to_string(),
-        ),
-        summary_text_row("degraded maps", &process_totals.degraded_maps.to_string()),
     ];
     frame.render_widget(
         Table::new(
@@ -265,15 +308,23 @@ fn render_overview(frame: &mut Frame<'_>, app: &App, area: Rect) {
             [Constraint::Length(24), Constraint::Length(16)],
         )
         .header(header_row(["Lens", "Value"]))
-        .block(panel("reconciliation"))
+        .block(panel("attribution lenses"))
         .column_spacing(1),
-        right[0],
+        right[1],
     );
 
     let warnings = app.warnings();
     let warning_lines = if warnings.is_empty() {
         vec![Line::from(Span::styled(
-            "No probe warnings. PSS is the attribution lens; tmpfs uses allocated blocks.",
+            format!(
+                "No probe warnings. {} processes, {sysv_segments} SysV segments; scan {} ms. \
+                 Degraded rollups/maps: {}/{}. Direct/unclassified is the physical residual after \
+                 disjoint kernel counters.",
+                process_totals.process_count,
+                app.last_capture_elapsed().as_millis(),
+                process_totals.degraded_rollups,
+                process_totals.degraded_maps,
+            ),
             Style::default().fg(FG),
         ))]
     } else {
@@ -293,7 +344,7 @@ fn render_overview(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .block(panel("probe notes"))
             .wrap(Wrap { trim: false })
             .style(Style::default().fg(FG)),
-        right[1],
+        right[2],
     );
 }
 
@@ -652,6 +703,14 @@ fn summary_row(label: &str, value: Bytes) -> Row<'static> {
     .style(Style::default().fg(FG))
 }
 
+fn accounting_row(label: &str, value: Bytes, total: Bytes) -> Row<'static> {
+    Row::new(vec![
+        Cell::from(label.to_string()),
+        usage_cell(value, total),
+    ])
+    .style(Style::default().fg(FG))
+}
+
 fn summary_text_row(label: &str, value: &str) -> Row<'static> {
     Row::new(vec![
         Cell::from(label.to_string()),
@@ -941,7 +1000,13 @@ fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
     text.extend([
         Line::from(""),
         section_heading("Notes"),
-        Line::from("Overview shows raw kernel counters and the main reconciliation lenses."),
+        Line::from(
+            "Overview reconciles physical RAM; direct/unclassified catches pages absent from \
+             disjoint kernel counters.",
+        ),
+        Line::from(
+            "NVIDIA system pools are split from that residual when shrinker debugfs is readable.",
+        ),
         Line::from("Processes uses PSS so shared pages are not double-counted."),
         Line::from(
             "Tmpfs uses allocated blocks, which is closer to actual backing than file length.",

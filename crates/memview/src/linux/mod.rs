@@ -58,9 +58,6 @@ pub fn run() -> MainResult {
             app.apply_worker_event(event, &commands);
             dirty = true;
         }
-        if app.poll_deletion(&commands) {
-            dirty = true;
-        }
 
         let now = Instant::now();
         let redraw_animation = app.needs_periodic_redraw() && now >= next_animated_redraw;

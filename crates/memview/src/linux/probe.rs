@@ -1,10 +1,12 @@
 use super::model::{
     Bytes, CaptureStamp, Inventory, Ledger, LedgerState, Meminfo, MeminfoEntry, MemoryRollup,
-    Metric, ObjectConsumer, ObjectKind, ObjectUsage, Pid, ProcessCwd, ProcessKey, ProcessNode,
-    ProcessRecord, ProcessTotals, ProcessTree, ProcessTreeStats, Processes, Shared, SharedObject,
-    SysvSegment, TmpfsMount, TmpfsNode, TmpfsNodeKind,
+    Metric, NvidiaPoolLedger, NvidiaPoolSnapshot, ObjectConsumer, ObjectKind, ObjectUsage, Pid,
+    ProcessCwd, ProcessKey, ProcessNode, ProcessRecord, ProcessTotals, ProcessTree,
+    ProcessTreeStats, Processes, Shared, SharedObject, SysvSegment, TmpfsMount, TmpfsNode,
+    TmpfsNodeKind,
 };
 use color_eyre::eyre::{Context, Result, eyre};
+use rustix::param::page_size;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
@@ -18,6 +20,9 @@ use uzers::get_user_by_uid;
 use walkdir::WalkDir;
 
 const DELETED_MAPPING_SUFFIX: &str = " (deleted)";
+const NVIDIA_PARAMS: &str = "/proc/driver/nvidia/params";
+const SHRINKER_ROOT: &str = "/sys/kernel/debug/shrinker";
+const NVIDIA_POOL_PREFIX: &str = "nv-sysmem-alloc-node-";
 
 #[derive(Debug)]
 pub struct ProcessMappingScan {
@@ -46,6 +51,16 @@ pub fn capture_inventory() -> Result<Ledger<Inventory>> {
         .iter()
         .map(|segment| segment.rss)
         .fold(Bytes::ZERO, |total, rss| total + rss);
+    let nvidia_pools = read_nvidia_pool_ledger(&mut warnings);
+    if let Some(NvidiaPoolLedger::Exact(snapshot)) = nvidia_pools
+        && snapshot.bytes > meminfo.physical_ledger().direct
+    {
+        warnings.push(
+            "NVIDIA pool count exceeds the direct/unclassified residual; the independently read \
+             kernel snapshots raced"
+                .to_string(),
+        );
+    }
 
     Ok(Ledger {
         stamp: CaptureStamp {
@@ -56,9 +71,101 @@ pub fn capture_inventory() -> Result<Ledger<Inventory>> {
             meminfo,
             sysv_segments,
             sysv_rss_total,
+            nvidia_pools,
         },
         warnings,
     })
+}
+
+fn read_nvidia_pool_ledger(warnings: &mut Vec<String>) -> Option<NvidiaPoolLedger> {
+    let params = match fs::read_to_string(NVIDIA_PARAMS) {
+        Ok(params) => params,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            warnings.push(format!("NVIDIA driver parameters unavailable: {error}"));
+            return Some(NvidiaPoolLedger::Inaccessible);
+        }
+    };
+    let mask = nvidia_pool_mask(&params)?;
+    if mask == 0 {
+        return Some(NvidiaPoolLedger::Disabled);
+    }
+
+    match read_nvidia_pool_snapshot(Path::new(SHRINKER_ROOT), page_size()) {
+        Ok(snapshot) => Some(NvidiaPoolLedger::Exact(snapshot)),
+        Err(error) => {
+            warnings.push(format!(
+                "NVIDIA system page pools are enabled but their shrinker counts are unavailable: \
+                 {error}. The direct/unclassified residual still includes them"
+            ));
+            Some(NvidiaPoolLedger::Inaccessible)
+        }
+    }
+}
+
+fn nvidia_pool_mask(params: &str) -> Option<u64> {
+    params.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == "EnableSystemMemoryPools")
+            .then(|| value.trim().parse().ok())
+            .flatten()
+    })
+}
+
+fn read_nvidia_pool_snapshot(root: &Path, page_size: usize) -> Result<NvidiaPoolSnapshot> {
+    let mut bytes = 0u64;
+    let mut pool_count = 0usize;
+
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let Some((node, order)) = parse_nvidia_pool_name(&entry.file_name()) else {
+            continue;
+        };
+        let count_text = fs::read_to_string(entry.path().join("count"))?;
+        let objects = parse_shrinker_node_count(&count_text, node)?;
+        let pool_bytes = nvidia_pool_bytes(objects, page_size, order)?;
+        bytes = bytes
+            .checked_add(pool_bytes)
+            .ok_or_else(|| eyre!("NVIDIA pool total overflows"))?;
+        pool_count += 1;
+    }
+
+    Ok(NvidiaPoolSnapshot {
+        bytes: Bytes(bytes),
+        pool_count,
+    })
+}
+
+fn parse_nvidia_pool_name(name: &OsStr) -> Option<(usize, u32)> {
+    let suffix = name.to_str()?.strip_prefix(NVIDIA_POOL_PREFIX)?;
+    let (node, order_and_id) = suffix.split_once("-order-")?;
+    let order = order_and_id.split('-').next()?;
+    Some((node.parse().ok()?, order.parse().ok()?))
+}
+
+fn parse_shrinker_node_count(text: &str, node: usize) -> Result<u64> {
+    let column = node
+        .checked_add(1)
+        .ok_or_else(|| eyre!("NUMA node index overflows"))?;
+    text.lines().try_fold(0u64, |total, line| {
+        let count = line
+            .split_whitespace()
+            .nth(column)
+            .ok_or_else(|| eyre!("shrinker count omits NUMA node {node}"))?
+            .parse::<u64>()?;
+        total
+            .checked_add(count)
+            .ok_or_else(|| eyre!("shrinker object count overflows"))
+    })
+}
+
+fn nvidia_pool_bytes(objects: u64, page_size: usize, order: u32) -> Result<u64> {
+    let bytes_per_object = (page_size as u64)
+        .checked_shl(order)
+        .ok_or_else(|| eyre!("NVIDIA pool page order {order} overflows"))?;
+    objects
+        .checked_mul(bytes_per_object)
+        .ok_or_else(|| eyre!("NVIDIA pool byte count overflows"))
 }
 
 pub fn capture_processes() -> Result<Ledger<Processes>> {
@@ -1281,6 +1388,25 @@ fn parse_size_option(value: &str) -> Option<Bytes> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_nvidia_pool_parameter_and_shrinker_identity() {
+        let params = "Foo: 1\nEnableSystemMemoryPools: 529\nBar: 2\n";
+        assert_eq!(nvidia_pool_mask(params), Some(529));
+        assert_eq!(
+            parse_nvidia_pool_name(OsStr::new("nv-sysmem-alloc-node-3-order-9-417")),
+            Some((3, 9))
+        );
+        assert_eq!(parse_nvidia_pool_name(OsStr::new("dentry-12")), None);
+    }
+
+    #[test]
+    fn converts_nvidia_shrinker_objects_by_numa_node_and_page_order() {
+        let count = "0 11 13 17\n";
+        assert_eq!(parse_shrinker_node_count(count, 1).ok(), Some(13));
+        assert_eq!(nvidia_pool_bytes(13, 4096, 9).ok(), Some(13 << 21));
+        assert!(parse_shrinker_node_count(count, 3).is_err());
+    }
 
     #[test]
     fn parses_process_identity_after_parenthesized_command() {

@@ -52,10 +52,6 @@ impl Ledgers {
         self.tmpfs.as_ref().map(|ledger| &ledger.value)
     }
 
-    pub(super) fn tmpfs_data_mut(&mut self) -> Option<&mut Tmpfs> {
-        self.tmpfs.as_mut().map(|ledger| &mut ledger.value)
-    }
-
     pub(super) fn shared_data(&self) -> Option<&Shared> {
         self.shared.as_ref().map(|ledger| &ledger.value)
     }

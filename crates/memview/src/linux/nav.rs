@@ -71,7 +71,6 @@ pub enum Action {
     CycleMetric,
     CycleScope,
     Refresh,
-    Delete,
     Kill,
     Move(isize),
     PageUp,
@@ -329,13 +328,6 @@ const TMPFS_ACTIONS: &[Binding] = &[
         "r",
         "refresh mount",
         commands![(Chord::Char('r'), Action::Refresh)]
-    ),
-    binding!(
-        "d",
-        "delete selected tmpfs entry recursively if directory",
-        "d",
-        "delete",
-        commands![(Chord::Char('d'), Action::Delete)]
     ),
 ];
 

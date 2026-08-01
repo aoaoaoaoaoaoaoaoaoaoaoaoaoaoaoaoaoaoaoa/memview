@@ -3,17 +3,8 @@ use super::super::model::{
     ProcessTreeStats,
 };
 use super::*;
-
-#[derive(Clone, Debug)]
-struct TestRow(u8);
-
-impl IdentifiedRow for TestRow {
-    type Key = u8;
-
-    fn key(&self) -> &Self::Key {
-        &self.0
-    }
-}
+use std::path::Path;
+use std::sync::mpsc::{self, Receiver};
 
 fn tmpfs_mount(path: &str, allocated: Bytes) -> TmpfsMount {
     TmpfsMount {
@@ -70,7 +61,10 @@ fn ledger<T>(value: T) -> Ledger<T> {
 }
 
 fn tmpfs_ledger(mounts: Vec<TmpfsMount>) -> Ledger<Tmpfs> {
-    let allocated_total = tmpfs_allocated_total(&mounts);
+    let allocated_total = mounts
+        .iter()
+        .map(|mount| mount.root.allocated)
+        .fold(Bytes::ZERO, |total, allocated| total + allocated);
     ledger(Tmpfs {
         mounts,
         allocated_total,
@@ -222,22 +216,6 @@ fn process_search_matches_cwd() {
 }
 
 #[test]
-fn pane_rows_can_select_deleted_row_successor_slot() {
-    let mut rows = PaneRows::default();
-    rows.install(vec![TestRow(1), TestRow(2), TestRow(3)]);
-    let _ = rows.move_by(1);
-    let successor = rows.selected_slot().expect("selected successor row slot");
-
-    rows.install(vec![TestRow(1), TestRow(3)]);
-    let _ = rows.select_clamped(successor);
-    assert_eq!(rows.selected().map(|row| row.0), Some(3));
-
-    rows.install(vec![TestRow(1)]);
-    let _ = rows.select_clamped(successor);
-    assert_eq!(rows.selected().map(|row| row.0), Some(1));
-}
-
-#[test]
 fn tmpfs_background_rebuilds_stay_pinned_to_top_until_user_entry() {
     let mut app = App::new(UiState::default());
     app.ledgers.tmpfs = Some(tmpfs_ledger(vec![tmpfs_mount("/tmpfs-small", Bytes(1))]));
@@ -284,122 +262,6 @@ fn first_tmpfs_entry_seizes_top_then_preserves_user_anchor() {
         app.tmpfs_rows.selected().map(|row| row.path.as_path()),
         Some(Path::new("/tmpfs-big"))
     );
-}
-
-#[test]
-fn optimistic_tmpfs_delete_prunes_immediately_and_keeps_successor_slot() {
-    let mut app = App::new(UiState::default());
-    app.tab = Tab::Tmpfs;
-    app.ledgers.tmpfs = Some(tmpfs_ledger(vec![tmpfs_tree(
-        "/proc/self/memview-delete-test",
-        Bytes(30),
-        vec![
-            tmpfs_dir(
-                "/proc/self/memview-delete-test/victim",
-                Bytes(20),
-                Vec::new(),
-            ),
-            tmpfs_dir("/proc/self/memview-delete-test/next", Bytes(10), Vec::new()),
-        ],
-    )]));
-    app.rebuild_tmpfs_rows();
-    let _ = app.tmpfs_rows.move_by(1);
-
-    app.delete_current_tmpfs_entry();
-
-    assert_eq!(app.deletion_count(), 1);
-    assert_eq!(
-        app.tmpfs_rows()
-            .iter()
-            .map(|row| row.path.as_path())
-            .collect::<Vec<_>>(),
-        vec![
-            Path::new("/proc/self/memview-delete-test"),
-            Path::new("/proc/self/memview-delete-test/next"),
-        ]
-    );
-    assert_eq!(app.selected_tmpfs_row(), 1);
-}
-
-#[test]
-fn confirmed_tmpfs_tombstone_prunes_stale_scan_and_clears_after_absent_scan() {
-    let stale = tmpfs_tree(
-        "/tmp/memview-tombstone-test",
-        Bytes(30),
-        vec![
-            tmpfs_dir("/tmp/memview-tombstone-test/victim", Bytes(20), Vec::new()),
-            tmpfs_dir("/tmp/memview-tombstone-test/next", Bytes(10), Vec::new()),
-        ],
-    );
-    let fresh = tmpfs_tree(
-        "/tmp/memview-tombstone-test",
-        Bytes(10),
-        vec![tmpfs_dir(
-            "/tmp/memview-tombstone-test/next",
-            Bytes(10),
-            Vec::new(),
-        )],
-    );
-    let victim = PathBuf::from("/tmp/memview-tombstone-test/victim");
-    let mut app = App::new(UiState::default());
-    app.ledgers.tmpfs = Some(tmpfs_ledger(vec![stale.clone()]));
-    let _ = app
-        .deletions
-        .insert(victim.clone(), DeletionState::Confirmed);
-
-    app.install_tmpfs_mount(ledger(stale));
-    assert!(!app.tmpfs_rows().iter().any(|row| row.path == victim));
-    assert!(app.deletions.contains_key(&victim));
-
-    app.install_tmpfs_mount(ledger(fresh));
-    assert!(!app.deletions.contains_key(&victim));
-}
-
-#[test]
-fn deletion_receiver_transitions_are_total() {
-    let (processes, _requests) = mpsc::channel();
-    let commands = WorkerPort::process_harness(processes);
-    let mount_point = PathBuf::from("/tmp");
-
-    let deleted = PathBuf::from("/tmp/deleted");
-    let mut app = App::new(UiState::default());
-    let _ = app_deletion(&mut app, deleted.clone(), mount_point.clone(), {
-        let (sender, result) = mpsc::channel();
-        sender.send(DeleteOutcome::Deleted).expect("receiver lives");
-        result
-    });
-    assert!(app.poll_deletion(&commands));
-    assert!(matches!(
-        app.deletions.get(&deleted),
-        Some(DeletionState::Confirmed)
-    ));
-
-    let disconnected = PathBuf::from("/tmp/disconnected");
-    let (sender, result) = mpsc::channel();
-    drop(sender);
-    let _ = app_deletion(&mut app, disconnected.clone(), mount_point, result);
-    assert!(app.poll_deletion(&commands));
-    assert!(!app.deletions.contains_key(&disconnected));
-    assert!(
-        app.last_error
-            .as_deref()
-            .is_some_and(|error| error.contains("disconnected"))
-    );
-}
-
-fn app_deletion(
-    app: &mut App,
-    path: PathBuf,
-    mount_point: PathBuf,
-    result: Receiver<DeleteOutcome>,
-) -> Option<DeletionState> {
-    app.deletions.insert(
-        path,
-        DeletionState::Running(DeleteTask {
-            mount_point,
-            result,
-        }),
-    )
 }
 
 #[test]

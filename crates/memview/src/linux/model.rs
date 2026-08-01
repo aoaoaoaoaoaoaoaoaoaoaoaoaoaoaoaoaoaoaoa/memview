@@ -214,6 +214,64 @@ impl Meminfo {
             .find(|entry| entry.key == key)
             .map_or(Bytes::ZERO, |entry| entry.value)
     }
+
+    #[must_use]
+    pub fn physical_ledger(&self) -> PhysicalMemoryLedger {
+        let sum = |keys: &[&str]| {
+            keys.iter()
+                .map(|key| self.get(key))
+                .fold(Bytes::ZERO, |total, value| total + value)
+        };
+        let total = self.get("MemTotal");
+        let free = self.get("MemFree");
+        let allocated = total - free;
+        let lru = sum(&[
+            "Active(anon)",
+            "Inactive(anon)",
+            "Active(file)",
+            "Inactive(file)",
+            "Unevictable",
+        ]);
+        let slab = self.get("Slab");
+        let hugetlb = self.get("Hugetlb");
+        let kernel = sum(&[
+            "KernelStack",
+            "ShadowCallStack",
+            "PageTables",
+            "SecPageTables",
+            "Percpu",
+            "Zswap",
+            "HardwareCorrupted",
+            "Unaccepted",
+            "Balloon",
+            "GPUActive",
+            "GPUReclaim",
+        ]);
+        let classified = lru + slab + hugetlb + kernel;
+
+        PhysicalMemoryLedger {
+            total,
+            free,
+            allocated,
+            lru,
+            slab,
+            hugetlb,
+            kernel,
+            direct: allocated - classified,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PhysicalMemoryLedger {
+    pub total: Bytes,
+    pub free: Bytes,
+    pub allocated: Bytes,
+    pub lru: Bytes,
+    pub slab: Bytes,
+    pub hugetlb: Bytes,
+    pub kernel: Bytes,
+    pub direct: Bytes,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -526,11 +584,25 @@ pub struct Ledger<T> {
     pub warnings: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NvidiaPoolSnapshot {
+    pub bytes: Bytes,
+    pub pool_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NvidiaPoolLedger {
+    Disabled,
+    Exact(NvidiaPoolSnapshot),
+    Inaccessible,
+}
+
 #[derive(Clone, Debug)]
 pub struct Inventory {
     pub meminfo: Meminfo,
     pub sysv_segments: Vec<SysvSegment>,
     pub sysv_rss_total: Bytes,
+    pub nvidia_pools: Option<NvidiaPoolLedger>,
 }
 
 #[derive(Clone, Debug)]
@@ -550,4 +622,39 @@ pub struct Tmpfs {
 pub struct Shared {
     pub meminfo: Meminfo,
     pub objects: Vec<SharedObject>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn physical_ledger_leaves_direct_allocator_pages_as_an_explicit_residual() {
+        let entries = [
+            ("MemTotal", 1_000),
+            ("MemFree", 100),
+            ("Active(anon)", 200),
+            ("Inactive(anon)", 100),
+            ("Active(file)", 100),
+            ("Inactive(file)", 90),
+            ("Unevictable", 10),
+            ("Slab", 100),
+            ("Hugetlb", 100),
+            ("KernelStack", 20),
+            ("PageTables", 20),
+            ("Percpu", 10),
+        ]
+        .into_iter()
+        .map(|(key, value)| MeminfoEntry {
+            key: key.to_string(),
+            value: Bytes(value),
+        })
+        .collect();
+        let ledger = Meminfo { entries }.physical_ledger();
+
+        assert_eq!(ledger.allocated, Bytes(900));
+        assert_eq!(ledger.lru, Bytes(500));
+        assert_eq!(ledger.kernel, Bytes(50));
+        assert_eq!(ledger.direct, Bytes(150));
+    }
 }

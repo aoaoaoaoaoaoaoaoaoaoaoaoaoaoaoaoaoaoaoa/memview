@@ -11,10 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKi
 use rustix::fd::OwnedFd;
 use rustix::process::{Pid as KernelPid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread;
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 mod ledgers;
@@ -199,10 +196,6 @@ impl<Row: IdentifiedRow> PaneRows<Row> {
         self.selected.map_or(0, RowIndex::get)
     }
 
-    fn selected_slot(&self) -> Option<RowIndex> {
-        self.selected
-    }
-
     fn selected_key(&self) -> Option<Row::Key> {
         self.selected().map(|row| row.key().clone())
     }
@@ -223,18 +216,6 @@ impl<Row: IdentifiedRow> PaneRows<Row> {
 
         self.rows = rows;
         self.selected = selected;
-    }
-
-    fn select_clamped(&mut self, index: RowIndex) -> bool {
-        if self.rows.is_empty() {
-            let changed = self.selected.is_some();
-            self.selected = None;
-            return changed;
-        }
-        let next = RowIndex::new(index.get().min(self.rows.len() - 1));
-        let changed = self.selected != Some(next);
-        self.selected = Some(next);
-        changed
     }
 
     fn move_by(&mut self, delta: isize) -> bool {
@@ -481,7 +462,6 @@ pub struct App {
     tmpfs_folds: BTreeMap<PathBuf, FoldOverride>,
     process_mappings: MappingLedgers,
     shared_scan_started_at: Option<Instant>,
-    deletions: BTreeMap<PathBuf, DeletionState>,
     tmpfs_selection: SelectionCustody,
     process_rows: PaneRows<FlatProcessRow>,
     tmpfs_rows: PaneRows<FlatTmpfsRow>,
@@ -557,45 +537,6 @@ impl ProcessKillTarget {
     }
 }
 
-struct DeleteTask {
-    mount_point: PathBuf,
-    result: Receiver<DeleteOutcome>,
-}
-
-enum DeletionState {
-    Running(DeleteTask),
-    Confirmed,
-}
-
-enum DeleteOutcome {
-    Deleted,
-    Failed(String),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DeleteKind {
-    Directory,
-    File,
-}
-
-impl TryFrom<TmpfsNodeKind> for DeleteKind {
-    type Error = ();
-
-    fn try_from(kind: TmpfsNodeKind) -> std::result::Result<Self, Self::Error> {
-        match kind {
-            TmpfsNodeKind::Mount => Err(()),
-            TmpfsNodeKind::Directory => Ok(Self::Directory),
-            TmpfsNodeKind::File
-            | TmpfsNodeKind::Symlink
-            | TmpfsNodeKind::Socket
-            | TmpfsNodeKind::Fifo
-            | TmpfsNodeKind::CharDevice
-            | TmpfsNodeKind::BlockDevice
-            | TmpfsNodeKind::Other => Ok(Self::File),
-        }
-    }
-}
-
 impl App {
     #[must_use]
     pub fn new(state: UiState) -> Self {
@@ -616,7 +557,6 @@ impl App {
             tmpfs_folds: BTreeMap::new(),
             process_mappings: MappingLedgers::default(),
             shared_scan_started_at: None,
-            deletions: BTreeMap::new(),
             tmpfs_selection: SelectionCustody::default(),
             process_rows: PaneRows::default(),
             tmpfs_rows: PaneRows::default(),
@@ -749,12 +689,9 @@ impl App {
     fn install_tmpfs_mount(&mut self, ledger: Ledger<TmpfsMount>) {
         let Ledger {
             stamp,
-            mut value,
+            value,
             warnings,
         } = ledger;
-        let mount_point = value.mount_point.clone();
-        self.reconcile_confirmed_deletions(std::slice::from_ref(&value), &mount_point);
-        self.prune_tmpfs_tombstones(std::slice::from_mut(&mut value));
 
         self.ledgers.last_stamp = Some(stamp);
         let tmpfs = self.ledgers.tmpfs.get_or_insert_with(|| Ledger {
@@ -788,84 +725,6 @@ impl App {
             .map(|mount| mount.root.allocated)
             .fold(Bytes::ZERO, |total, allocated| total + allocated);
         self.rebuild_tmpfs_rows();
-    }
-
-    fn tmpfs_tombstones(&self) -> BTreeSet<PathBuf> {
-        self.deletions.keys().cloned().collect()
-    }
-
-    fn prune_tmpfs_tombstones(&self, mounts: &mut [TmpfsMount]) {
-        let tombstones = self.tmpfs_tombstones();
-        prune_tmpfs_tombstones(mounts, &tombstones);
-    }
-
-    fn prune_tmpfs_path(&mut self, path: &Path) {
-        let mut tombstones = self.tmpfs_tombstones();
-        let _ = tombstones.insert(path.to_path_buf());
-        let Some(tmpfs) = self.ledgers.tmpfs_data_mut() else {
-            return;
-        };
-        prune_tmpfs_tombstones(&mut tmpfs.mounts, &tombstones);
-        tmpfs.allocated_total = tmpfs_allocated_total(&tmpfs.mounts);
-        self.rebuild_tmpfs_rows();
-    }
-
-    fn reconcile_confirmed_deletions(&mut self, mounts: &[TmpfsMount], mount_point: &Path) {
-        self.deletions.retain(|path, state| {
-            if matches!(state, DeletionState::Running(_)) || !path.starts_with(mount_point) {
-                return true;
-            }
-            mounts
-                .iter()
-                .filter(|mount| path.starts_with(&mount.mount_point))
-                .any(|mount| tmpfs_tree_contains_path(&mount.root, path))
-        });
-    }
-
-    pub fn poll_deletion(&mut self, commands: &WorkerPort) -> bool {
-        let mut changed = false;
-        let running = self
-            .deletions
-            .iter()
-            .filter(|&(_path, state)| matches!(state, DeletionState::Running(_)))
-            .map(|(path, _state)| path.clone())
-            .collect::<Vec<_>>();
-        for path in running {
-            let outcome = match self.deletions.get(&path) {
-                Some(DeletionState::Running(task)) => task.result.try_recv(),
-                Some(DeletionState::Confirmed) | None => continue,
-            };
-            match outcome {
-                Ok(DeleteOutcome::Deleted) => {
-                    let Some(DeletionState::Running(task)) = self.deletions.remove(&path) else {
-                        continue;
-                    };
-                    let _ = self.deletions.insert(path, DeletionState::Confirmed);
-                    self.last_error = None;
-                    commands.refresh_tmpfs_mount(task.mount_point);
-                    changed = true;
-                }
-                Ok(DeleteOutcome::Failed(error)) => {
-                    let Some(DeletionState::Running(task)) = self.deletions.remove(&path) else {
-                        continue;
-                    };
-                    self.last_error = Some(error);
-                    commands.refresh_tmpfs_mount(task.mount_point);
-                    changed = true;
-                }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {
-                    let Some(DeletionState::Running(task)) = self.deletions.remove(&path) else {
-                        continue;
-                    };
-                    self.last_error =
-                        Some(format!("delete task disconnected for {}", path.display()));
-                    commands.refresh_tmpfs_mount(task.mount_point);
-                    changed = true;
-                }
-            }
-        }
-        changed
     }
 
     #[must_use]
@@ -1068,14 +927,6 @@ impl App {
     }
 
     #[must_use]
-    pub fn deletion_count(&self) -> usize {
-        self.deletions
-            .values()
-            .filter(|state| matches!(state, DeletionState::Running(_)))
-            .count()
-    }
-
-    #[must_use]
     pub fn process_rows(&self) -> &[FlatProcessRow] {
         self.process_rows.rows()
     }
@@ -1215,7 +1066,6 @@ impl App {
                 self.tree_scope = self.tree_scope.next();
                 self.rebuild_filterable_rows();
             }
-            Action::Delete => self.delete_current_tmpfs_entry(),
             Action::Kill => self.arm_process_kill(),
             Action::Refresh => self.refresh_current_pane(commands),
             Action::Move(delta) => {
@@ -1502,57 +1352,6 @@ impl App {
         }
     }
 
-    fn delete_current_tmpfs_entry(&mut self) {
-        if self.tab != Tab::Tmpfs {
-            return;
-        }
-        let Some((path, kind)) = self
-            .tmpfs_rows
-            .selected()
-            .map(|row| (row.path.clone(), row.kind))
-        else {
-            return;
-        };
-        let Some(mount_point) = self
-            .selected_tmpfs_mount()
-            .map(|mount| mount.mount_point.clone())
-        else {
-            return;
-        };
-
-        let Ok(kind) = DeleteKind::try_from(kind) else {
-            self.last_error = Some(format!(
-                "refusing to delete tmpfs mount root {}",
-                path.display()
-            ));
-            return;
-        };
-
-        let Some(successor) = self.tmpfs_rows.selected_slot() else {
-            return;
-        };
-        let (sender, result) = mpsc::channel();
-        let task_path = path.clone();
-        let _handle = thread::spawn(move || {
-            let outcome = delete_tmpfs_entry(&task_path, kind)
-                .map_err(|error| format!("delete {}: {error}", task_path.display()))
-                .map_or_else(DeleteOutcome::Failed, |()| DeleteOutcome::Deleted);
-            let _ = sender.send(outcome);
-        });
-
-        self.last_error = None;
-        let _ = self.tmpfs_folds.remove(&path);
-        let _ = self.deletions.insert(
-            path.clone(),
-            DeletionState::Running(DeleteTask {
-                mount_point,
-                result,
-            }),
-        );
-        self.prune_tmpfs_path(&path);
-        let _ = self.tmpfs_rows.select_clamped(successor);
-    }
-
     fn arm_process_kill(&mut self) {
         if self.tab != Tab::Processes {
             return;
@@ -1590,88 +1389,6 @@ fn open_pidfd(pid: Pid) -> std::result::Result<OwnedFd, String> {
     };
     pidfd_open(kernel_pid, PidfdFlags::empty())
         .map_err(|error| format!("pidfd_open {pid}: {error}"))
-}
-
-fn delete_tmpfs_entry(path: &Path, kind: DeleteKind) -> std::io::Result<()> {
-    let result = match kind {
-        DeleteKind::Directory => fs::remove_dir_all(path),
-        DeleteKind::File => fs::remove_file(path),
-    };
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct TmpfsUsage {
-    allocated: Bytes,
-    logical: Bytes,
-}
-
-impl TmpfsUsage {
-    #[must_use]
-    fn from_node(node: &TmpfsNode) -> Self {
-        Self {
-            allocated: node.allocated,
-            logical: node.logical,
-        }
-    }
-
-    fn absorb(&mut self, usage: Self) {
-        self.allocated += usage.allocated;
-        self.logical += usage.logical;
-    }
-}
-
-fn prune_tmpfs_tombstones(mounts: &mut [TmpfsMount], tombstones: &BTreeSet<PathBuf>) {
-    if tombstones.is_empty() {
-        return;
-    }
-    for mount in mounts {
-        let removed = prune_tmpfs_node_children(&mut mount.root, tombstones);
-        mount.root.allocated -= removed.allocated;
-        mount.root.logical -= removed.logical;
-    }
-}
-
-fn prune_tmpfs_node_children(node: &mut TmpfsNode, tombstones: &BTreeSet<PathBuf>) -> TmpfsUsage {
-    let mut removed = TmpfsUsage::default();
-    node.children.retain_mut(|child| {
-        if tmpfs_path_is_tombstoned(&child.path, tombstones) {
-            removed.absorb(TmpfsUsage::from_node(child));
-            return false;
-        }
-        let child_removed = prune_tmpfs_node_children(child, tombstones);
-        child.allocated -= child_removed.allocated;
-        child.logical -= child_removed.logical;
-        removed.absorb(child_removed);
-        true
-    });
-    removed
-}
-
-fn tmpfs_path_is_tombstoned(path: &Path, tombstones: &BTreeSet<PathBuf>) -> bool {
-    tombstones
-        .iter()
-        .any(|tombstone| path == tombstone || path.starts_with(tombstone))
-}
-
-fn tmpfs_tree_contains_path(node: &TmpfsNode, path: &Path) -> bool {
-    node.path == path
-        || (path.starts_with(&node.path)
-            && node
-                .children
-                .iter()
-                .any(|child| tmpfs_tree_contains_path(child, path)))
-}
-
-fn tmpfs_allocated_total(mounts: &[TmpfsMount]) -> Bytes {
-    mounts
-        .iter()
-        .map(|mount| mount.root.allocated)
-        .fold(Bytes::ZERO, |total, allocated| total + allocated)
 }
 
 #[cfg(test)]
