@@ -1,50 +1,88 @@
 use super::super::model::{
     BackingIdentity, CaptureId, CaptureStamp, LedgerState, MemoryRollup, ObjectKind,
-    ProcessCoverage, ProcessCwd, ProcessMemory, ProcessRecord, ProcessTree,
+    ProcessCoverage, ProcessCwd, ProcessMemory, ProcessRecord, ProcessTree, TmpfsNodeKind,
+    TmpfsStorageId,
 };
 use super::*;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 
 fn tmpfs_mount(path: &str, allocated: Bytes) -> TmpfsMount {
-    TmpfsMount {
-        mount_point: PathBuf::from(path),
-        source: "tmpfs".to_string(),
-        size_limit: None,
-        root: TmpfsNode {
-            path: PathBuf::from(path),
-            name: path.to_string(),
-            kind: TmpfsNodeKind::Mount,
-            allocated,
-            logical: allocated,
-            children: Vec::new(),
-        },
-    }
+    tmpfs_tree(path, allocated, Vec::new())
 }
 
-fn tmpfs_tree(path: &str, allocated: Bytes, children: Vec<TmpfsNode>) -> TmpfsMount {
-    TmpfsMount {
-        mount_point: PathBuf::from(path),
-        source: "tmpfs".to_string(),
-        size_limit: None,
-        root: TmpfsNode {
+#[derive(Clone)]
+struct TestTmpfsNode {
+    path: PathBuf,
+    allocated: Bytes,
+    children: Vec<Self>,
+}
+
+fn tmpfs_tree(path: &str, allocated: Bytes, children: Vec<TestTmpfsNode>) -> TmpfsMount {
+    let mut nodes = Vec::new();
+    let root = materialize_test_tmpfs_node(
+        TestTmpfsNode {
             path: PathBuf::from(path),
-            name: path.to_string(),
-            kind: TmpfsNodeKind::Mount,
             allocated,
-            logical: allocated,
             children,
         },
+        TmpfsNodeKind::Mount,
+        &mut nodes,
+    );
+    TmpfsMount {
+        mount_point: PathBuf::from(path),
+        source: "tmpfs".to_string(),
+        size_limit: None,
+        root,
+        nodes,
     }
 }
 
-fn tmpfs_dir(path: &str, allocated: Bytes, children: Vec<TmpfsNode>) -> TmpfsNode {
-    TmpfsNode {
+fn materialize_test_tmpfs_node(
+    node: TestTmpfsNode,
+    kind: TmpfsNodeKind,
+    nodes: &mut Vec<TmpfsNode>,
+) -> TmpfsNodeId {
+    let id = TmpfsNodeId(nodes.len());
+    let storage = test_tmpfs_storage(&node.path);
+    nodes.push(TmpfsNode {
+        storage,
+        path: node.path,
+        kind,
+        allocated: node.allocated,
+        logical: node.allocated,
+        children: Vec::new(),
+    });
+    let mut children = node
+        .children
+        .into_iter()
+        .map(|child| materialize_test_tmpfs_node(child, TmpfsNodeKind::Directory, nodes))
+        .collect::<Vec<_>>();
+    children.sort_by(|lhs, rhs| {
+        nodes[rhs.0]
+            .allocated
+            .cmp(&nodes[lhs.0].allocated)
+            .then_with(|| nodes[lhs.0].path.cmp(&nodes[rhs.0].path))
+    });
+    nodes[id.0].children = children;
+    id
+}
+
+fn test_tmpfs_storage(path: &Path) -> TmpfsStorageId {
+    let inode = path
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    TmpfsStorageId { device: 1, inode }
+}
+
+fn tmpfs_dir(path: &str, allocated: Bytes, children: Vec<TestTmpfsNode>) -> TestTmpfsNode {
+    TestTmpfsNode {
         path: PathBuf::from(path),
-        name: path.to_string(),
-        kind: TmpfsNodeKind::Directory,
         allocated,
-        logical: allocated,
         children,
     }
 }
@@ -65,7 +103,7 @@ fn ledger<T>(value: T) -> Ledger<T> {
 fn tmpfs_ledger(mounts: Vec<TmpfsMount>) -> Ledger<Tmpfs> {
     let allocated_total = mounts
         .iter()
-        .map(|mount| mount.root.allocated)
+        .map(|mount| mount.root().allocated)
         .fold(Bytes::ZERO, |total, allocated| total + allocated);
     ledger(Tmpfs {
         mounts,
@@ -115,6 +153,13 @@ fn regex(pattern: &str) -> Search {
     Search::compile(pattern.to_string())
         .expect("test regex compiles")
         .expect("test regex is non-empty")
+}
+
+fn tmpfs_row_path<'a>(app: &'a App, row: &FlatTmpfsRow) -> &'a Path {
+    app.tmpfs_node(row)
+        .expect("tmpfs row resolves")
+        .path
+        .as_path()
 }
 
 #[test]
@@ -224,7 +269,9 @@ fn tmpfs_background_rebuilds_stay_pinned_to_top_until_user_entry() {
     app.ledgers.tmpfs = Some(tmpfs_ledger(vec![tmpfs_mount("/tmpfs-small", Bytes(1))]));
     app.rebuild_tmpfs_rows();
     assert_eq!(
-        app.tmpfs_rows.selected().map(|row| row.path.as_path()),
+        app.tmpfs_rows
+            .selected()
+            .map(|row| tmpfs_row_path(&app, row)),
         Some(Path::new("/tmpfs-small"))
     );
 
@@ -235,7 +282,9 @@ fn tmpfs_background_rebuilds_stay_pinned_to_top_until_user_entry() {
     app.rebuild_tmpfs_rows();
     assert_eq!(app.selected_tmpfs_row(), 0);
     assert_eq!(
-        app.tmpfs_rows.selected().map(|row| row.path.as_path()),
+        app.tmpfs_rows
+            .selected()
+            .map(|row| tmpfs_row_path(&app, row)),
         Some(Path::new("/tmpfs-big"))
     );
 }
@@ -280,7 +329,9 @@ fn first_tmpfs_entry_seizes_top_then_preserves_user_anchor() {
     ]));
     app.rebuild_tmpfs_rows();
     assert_eq!(
-        app.tmpfs_rows.selected().map(|row| row.path.as_path()),
+        app.tmpfs_rows
+            .selected()
+            .map(|row| tmpfs_row_path(&app, row)),
         Some(Path::new("/tmpfs-big"))
     );
 }
@@ -303,7 +354,7 @@ fn tmpfs_search_self_mode_filters_to_direct_matches_and_sums_them() {
     assert_eq!(
         app.tmpfs_rows()
             .iter()
-            .map(|row| row.path.as_path())
+            .map(|row| tmpfs_row_path(&app, row))
             .collect::<Vec<_>>(),
         vec![Path::new("/mnt/batch-b"), Path::new("/mnt/batch-a")]
     );
@@ -330,7 +381,7 @@ fn tmpfs_search_self_and_children_includes_context_parents_without_counting_them
     assert_eq!(
         app.tmpfs_rows()
             .iter()
-            .map(|row| (row.path.as_path(), row.search))
+            .map(|row| (tmpfs_row_path(&app, row), row.search))
             .collect::<Vec<_>>(),
         vec![
             (Path::new("/mnt"), SearchRole::Context),
@@ -376,11 +427,11 @@ fn page_keys_move_one_visible_pane() {
         (0..10)
             .map(|index| FlatTmpfsRow {
                 mount_index: 0,
-                path: PathBuf::from(format!("/tmp/{index}")),
-                name: index.to_string(),
-                kind: TmpfsNodeKind::File,
-                allocated: Bytes::ZERO,
-                logical: Bytes::ZERO,
+                node_id: TmpfsNodeId(index),
+                key: TmpfsStorageId {
+                    device: 1,
+                    inode: index as u64 + 1,
+                },
                 depth: 0,
                 fold: RowFold::Leaf,
                 search: SearchRole::Ordinary,

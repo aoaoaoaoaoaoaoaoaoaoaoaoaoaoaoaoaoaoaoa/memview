@@ -24,7 +24,7 @@ pub(super) fn build_tmpfs_rows(
     tmpfs: &Tmpfs,
     system_total: Bytes,
     scope: TreeScope,
-    overrides: &BTreeMap<PathBuf, FoldOverride>,
+    overrides: &BTreeMap<TmpfsStorageId, FoldOverride>,
     search: Option<&Search>,
 ) -> (Vec<FlatTmpfsRow>, SearchSummary) {
     build_forest_rows(
@@ -350,6 +350,7 @@ impl Forest for ProcessForest<'_> {
 #[derive(Clone, Copy)]
 struct TmpfsHandle<'a> {
     mount_index: usize,
+    node_id: TmpfsNodeId,
     node: &'a TmpfsNode,
 }
 
@@ -360,7 +361,7 @@ struct TmpfsForest<'a> {
 
 impl<'a> Forest for TmpfsForest<'a> {
     type Handle = TmpfsHandle<'a>;
-    type Key = PathBuf;
+    type Key = TmpfsStorageId;
     type Row = FlatTmpfsRow;
 
     fn roots(&self) -> Vec<Self::Handle> {
@@ -370,32 +371,27 @@ impl<'a> Forest for TmpfsForest<'a> {
             .enumerate()
             .map(|(mount_index, mount)| TmpfsHandle {
                 mount_index,
-                node: &mount.root,
+                node_id: mount.root,
+                node: mount.root(),
             })
             .collect()
     }
 
     fn children(&self, handle: Self::Handle) -> Vec<Self::Handle> {
-        let mut children = handle
+        handle
             .node
             .children
             .iter()
-            .map(|node| TmpfsHandle {
+            .map(|node_id| TmpfsHandle {
                 mount_index: handle.mount_index,
-                node,
+                node_id: *node_id,
+                node: self.tmpfs.mounts[handle.mount_index].node(*node_id),
             })
-            .collect::<Vec<_>>();
-        children.sort_by(|lhs, rhs| {
-            rhs.node
-                .allocated
-                .cmp(&lhs.node.allocated)
-                .then_with(|| lhs.node.path.cmp(&rhs.node.path))
-        });
-        children
+            .collect()
     }
 
     fn key(&self, handle: Self::Handle) -> Self::Key {
-        handle.node.path.clone()
+        handle.node.storage
     }
 
     fn direct_value(&self, handle: Self::Handle) -> Bytes {
@@ -407,8 +403,7 @@ impl<'a> Forest for TmpfsForest<'a> {
     }
 
     fn matches(&self, search: &Search, handle: Self::Handle) -> bool {
-        search.matches(&handle.node.name)
-            || search.matches(handle.node.kind.label())
+        search.matches(handle.node.kind.label())
             || search.matches(handle.node.path.to_string_lossy().as_ref())
     }
 
@@ -421,11 +416,8 @@ impl<'a> Forest for TmpfsForest<'a> {
     ) -> Self::Row {
         FlatTmpfsRow {
             mount_index: handle.mount_index,
-            path: handle.node.path.clone(),
-            name: handle.node.name.clone(),
-            kind: handle.node.kind,
-            allocated: handle.node.allocated,
-            logical: handle.node.logical,
+            node_id: handle.node_id,
+            key: handle.node.storage,
             depth,
             fold,
             search,

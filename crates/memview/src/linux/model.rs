@@ -585,12 +585,21 @@ impl TmpfsNodeKind {
 
 #[derive(Clone, Debug)]
 pub struct TmpfsNode {
+    pub storage: TmpfsStorageId,
     pub path: PathBuf,
-    pub name: String,
     pub kind: TmpfsNodeKind,
     pub allocated: Bytes,
     pub logical: Bytes,
-    pub children: Vec<TmpfsNode>,
+    pub children: Vec<TmpfsNodeId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TmpfsNodeId(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TmpfsStorageId {
+    pub device: u64,
+    pub inode: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -598,7 +607,20 @@ pub struct TmpfsMount {
     pub mount_point: PathBuf,
     pub source: String,
     pub size_limit: Option<Bytes>,
-    pub root: TmpfsNode,
+    pub root: TmpfsNodeId,
+    pub nodes: Vec<TmpfsNode>,
+}
+
+impl TmpfsMount {
+    #[must_use]
+    pub fn node(&self, id: TmpfsNodeId) -> &TmpfsNode {
+        &self.nodes[id.0]
+    }
+
+    #[must_use]
+    pub fn root(&self) -> &TmpfsNode {
+        self.node(self.root)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -3,7 +3,8 @@ use super::model::{
     MeminfoEntry, MemoryRollup, Metric, NvidiaPoolLedger, NvidiaPoolSnapshot, ObjectConsumer,
     ObjectKind, ObjectUsage, Pid, ProcessCoverage, ProcessCwd, ProcessKey, ProcessMemory,
     ProcessNode, ProcessRecord, ProcessTotals, ProcessTree, Processes, Shared, SharedObject,
-    StatusMemory, SysvSegment, Tmpfs, TmpfsCoverage, TmpfsMount, TmpfsNode, TmpfsNodeKind,
+    StatusMemory, SysvSegment, Tmpfs, TmpfsCoverage, TmpfsMount, TmpfsNode, TmpfsNodeId,
+    TmpfsNodeKind, TmpfsStorageId,
 };
 use color_eyre::eyre::{Context, Result, eyre};
 use rustix::param::page_size;
@@ -312,10 +313,10 @@ pub fn capture_tmpfs() -> Result<Ledger<Tmpfs>> {
         }
     }
     coverage.captured_filesystems = mounts.len();
-    mounts.sort_by_key(|mount| Reverse(mount.root.allocated));
+    mounts.sort_by_key(|mount| Reverse(mount.root().allocated));
     let allocated_total = mounts
         .iter()
-        .map(|mount| mount.root.allocated)
+        .map(|mount| mount.root().allocated)
         .fold(Bytes::ZERO, |total, allocated| total + allocated);
     if coverage.walk_errors > 0 {
         warnings.push(format!(
@@ -352,8 +353,8 @@ struct MountIndex {
 
 #[derive(Clone, Debug)]
 struct TmpfsBuilder {
+    storage: TmpfsStorageId,
     path: PathBuf,
-    name: String,
     kind: TmpfsNodeKind,
     allocated: Bytes,
     logical: Bytes,
@@ -1337,8 +1338,11 @@ fn scan_tmpfs_mount(info: &MountInfo, coverage: &mut TmpfsCoverage) -> Result<Tm
     let mut seen_storage = BTreeSet::<(u64, u64)>::new();
     let _ = seen_storage.insert((root_meta.dev(), root_meta.ino()));
     let mut nodes = vec![TmpfsBuilder {
+        storage: TmpfsStorageId {
+            device: root_meta.dev(),
+            inode: root_meta.ino(),
+        },
         path: info.mount_point.clone(),
-        name: info.mount_point.display().to_string(),
         kind: TmpfsNodeKind::Mount,
         allocated: metadata_allocated(&root_meta),
         logical: metadata_logical(&root_meta),
@@ -1388,8 +1392,11 @@ fn scan_tmpfs_mount(info: &MountInfo, coverage: &mut TmpfsCoverage) -> Result<Tm
         let index = nodes.len();
         nodes[parent].children.push(index);
         nodes.push(TmpfsBuilder {
+            storage: TmpfsStorageId {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
             path: path.to_path_buf(),
-            name: basename(path),
             kind: classify_tmpfs_entry(&metadata),
             allocated,
             logical,
@@ -1408,48 +1415,34 @@ fn scan_tmpfs_mount(info: &MountInfo, coverage: &mut TmpfsCoverage) -> Result<Tm
         nodes[parent].logical += logical;
     }
 
-    let mut nodes = nodes.into_iter().map(Some).collect::<Vec<_>>();
-    let root = materialize_tmpfs_node(0, &mut nodes)?;
+    for index in 0..nodes.len() {
+        let mut children = std::mem::take(&mut nodes[index].children);
+        children.sort_by(|lhs, rhs| {
+            nodes[*rhs]
+                .allocated
+                .cmp(&nodes[*lhs].allocated)
+                .then_with(|| nodes[*lhs].path.cmp(&nodes[*rhs].path))
+        });
+        nodes[index].children = children;
+    }
+    let nodes = nodes
+        .into_iter()
+        .map(|builder| TmpfsNode {
+            storage: builder.storage,
+            path: builder.path,
+            kind: builder.kind,
+            allocated: builder.allocated,
+            logical: builder.logical,
+            children: builder.children.into_iter().map(TmpfsNodeId).collect(),
+        })
+        .collect();
     Ok(TmpfsMount {
         mount_point: info.mount_point.clone(),
         source: info.source.clone(),
         size_limit: parse_tmpfs_size_limit(&info.super_options),
-        root,
+        root: TmpfsNodeId(0),
+        nodes,
     })
-}
-
-fn materialize_tmpfs_node(index: usize, nodes: &mut [Option<TmpfsBuilder>]) -> Result<TmpfsNode> {
-    let builder = nodes
-        .get_mut(index)
-        .and_then(Option::take)
-        .ok_or_else(|| eyre!("tmpfs tree lost arena node {index}"))?;
-
-    let mut children = builder
-        .children
-        .iter()
-        .map(|child| materialize_tmpfs_node(*child, nodes))
-        .collect::<Result<Vec<_>>>()?;
-    children.sort_by(|lhs, rhs| {
-        rhs.allocated
-            .cmp(&lhs.allocated)
-            .then_with(|| lhs.path.cmp(&rhs.path))
-    });
-
-    Ok(TmpfsNode {
-        path: builder.path,
-        name: builder.name,
-        kind: builder.kind,
-        allocated: builder.allocated,
-        logical: builder.logical,
-        children,
-    })
-}
-
-fn basename(path: &Path) -> String {
-    path.file_name()
-        .unwrap_or_else(|| OsStr::new("/"))
-        .to_string_lossy()
-        .into_owned()
 }
 
 fn metadata_allocated(metadata: &Metadata) -> Bytes {

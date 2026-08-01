@@ -1,6 +1,7 @@
 use super::model::{
     BackingIdentity, Bytes, Inventory, Ledger, Meminfo, Metric, ObjectUsage, Pid, ProcessKey,
-    ProcessNode, Processes, Shared, SharedObject, Tmpfs, TmpfsMount, TmpfsNode, TmpfsNodeKind,
+    ProcessNode, Processes, Shared, SharedObject, Tmpfs, TmpfsMount, TmpfsNode, TmpfsNodeId,
+    TmpfsStorageId,
 };
 use super::nav::{self, Action};
 pub use super::nav::{Binding, BindingSections, Tab};
@@ -11,7 +12,6 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKi
 use rustix::fd::OwnedFd;
 use rustix::process::{Pid as KernelPid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 mod ledgers;
@@ -89,11 +89,8 @@ pub struct FlatProcessRow {
 #[derive(Clone, Debug)]
 pub struct FlatTmpfsRow {
     pub mount_index: usize,
-    pub path: PathBuf,
-    pub name: String,
-    pub kind: TmpfsNodeKind,
-    pub allocated: Bytes,
-    pub logical: Bytes,
+    pub node_id: TmpfsNodeId,
+    key: TmpfsStorageId,
     pub depth: usize,
     pub fold: RowFold,
     pub search: SearchRole,
@@ -150,10 +147,10 @@ impl IdentifiedRow for FlatProcessRow {
 }
 
 impl IdentifiedRow for FlatTmpfsRow {
-    type Key = PathBuf;
+    type Key = TmpfsStorageId;
 
     fn key(&self) -> &Self::Key {
-        &self.path
+        &self.key
     }
 }
 
@@ -366,7 +363,7 @@ impl FoldMutation {
 
 enum FoldTarget {
     Process(ProcessKey),
-    Tmpfs(PathBuf),
+    Tmpfs(TmpfsStorageId),
 }
 
 impl<Key: Ord> FoldPolicy<'_, Key> {
@@ -459,7 +456,7 @@ pub struct App {
     tmpfs_search: SearchSummary,
     shared_search: SearchSummary,
     process_folds: BTreeMap<ProcessKey, FoldOverride>,
-    tmpfs_folds: BTreeMap<PathBuf, FoldOverride>,
+    tmpfs_folds: BTreeMap<TmpfsStorageId, FoldOverride>,
     process_mappings: MappingLedgers,
     shared_scan_started_at: Option<Instant>,
     tmpfs_selection: SelectionCustody,
@@ -978,8 +975,18 @@ impl App {
     }
 
     #[must_use]
-    pub fn selected_tmpfs_entry(&self) -> Option<&FlatTmpfsRow> {
-        self.tmpfs_rows.selected()
+    pub fn tmpfs_node(&self, row: &FlatTmpfsRow) -> Option<&TmpfsNode> {
+        self.ledgers
+            .tmpfs_data()?
+            .mounts
+            .get(row.mount_index)?
+            .nodes
+            .get(row.node_id.0)
+    }
+
+    #[must_use]
+    pub fn selected_tmpfs_node(&self) -> Option<&TmpfsNode> {
+        self.tmpfs_node(self.tmpfs_rows.selected()?)
     }
 
     #[must_use]
@@ -1347,7 +1354,7 @@ impl App {
             Tab::Tmpfs => self
                 .tmpfs_rows
                 .selected()
-                .map(|row| (FoldTarget::Tmpfs(row.path.clone()), row.fold)),
+                .map(|row| (FoldTarget::Tmpfs(row.key), row.fold)),
             Tab::Overview | Tab::Shared => None,
         };
         let Some((target, override_)) = target

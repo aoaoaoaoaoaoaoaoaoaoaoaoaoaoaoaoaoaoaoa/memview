@@ -593,7 +593,7 @@ fn render_tmpfs(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let table_rows = visible
         .iter()
         .enumerate()
-        .map(|(offset, row)| row_tmpfs(row, visible.start + offset == selected, capacity))
+        .map(|(offset, row)| row_tmpfs(tmpfs, row, visible.start + offset == selected, capacity))
         .collect::<Vec<_>>();
     frame.render_widget(
         Table::new(
@@ -625,8 +625,8 @@ fn render_tmpfs(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     let mut detail_lines = search_summary_lines(app, capacity);
     detail_lines.extend(
-        match (app.selected_tmpfs_mount(), app.selected_tmpfs_entry()) {
-            (Some(mount), Some(row)) => tmpfs_detail_lines(mount, row),
+        match (app.selected_tmpfs_mount(), app.selected_tmpfs_node()) {
+            (Some(mount), Some(node)) => tmpfs_detail_lines(mount, node),
             _ => vec![Line::from("No tmpfs node selected")],
         },
     );
@@ -825,23 +825,35 @@ fn row_process(
     ))
 }
 
-fn row_tmpfs(row: &FlatTmpfsRow, selected: bool, capacity: Bytes) -> Row<'static> {
+fn row_tmpfs(
+    tmpfs: &super::model::Tmpfs,
+    row: &FlatTmpfsRow,
+    selected: bool,
+    capacity: Bytes,
+) -> Row<'static> {
+    let mount = &tmpfs.mounts[row.mount_index];
+    let node = mount.node(row.node_id);
     let marker = match row.fold {
         RowFold::Leaf => " ",
         RowFold::Collapsed => "▸",
         RowFold::Expanded => "▾",
     };
-    let label = format!("{}{} {}", "  ".repeat(row.depth), marker, row.name);
+    let name = node
+        .path
+        .file_name()
+        .map_or_else(|| node.path.as_os_str(), |name| name)
+        .to_string_lossy();
+    let label = format!("{}{} {name}", "  ".repeat(row.depth), marker);
     Row::new(vec![
         Cell::from(label),
-        Cell::from(row.kind.label().to_string()),
-        usage_cell(row.allocated, capacity),
-        usage_cell(row.logical, capacity),
-        Cell::from(row.path.display().to_string()),
+        Cell::from(node.kind.label().to_string()),
+        usage_cell(node.allocated, capacity),
+        usage_cell(node.logical, capacity),
+        Cell::from(node.path.display().to_string()),
     ])
     .style(usage_style_for_role(
         selected,
-        row.allocated,
+        node.allocated,
         capacity,
         row.search,
     ))
@@ -882,23 +894,23 @@ fn row_object_usage(object: &ObjectUsage, capacity: Bytes) -> Row<'static> {
     .style(usage_style(false, object.rollup.pss, capacity))
 }
 
-fn tmpfs_detail_lines(mount: &TmpfsMount, row: &FlatTmpfsRow) -> Vec<Line<'static>> {
+fn tmpfs_detail_lines(mount: &TmpfsMount, node: &super::model::TmpfsNode) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(Span::styled(
-            row.path.display().to_string(),
+            node.path.display().to_string(),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
         detail_line("Mount", &mount.mount_point.display().to_string()),
         detail_line("Source", &mount.source),
-        detail_line("Kind", row.kind.label()),
-        detail_line("Allocated", &row.allocated.human_exact()),
-        detail_line("Logical", &row.logical.human_exact()),
+        detail_line("Kind", node.kind.label()),
+        detail_line("Allocated", &node.allocated.human_exact()),
+        detail_line("Logical", &node.logical.human_exact()),
     ];
     if let Some(limit) = mount.size_limit {
         lines.push(detail_line("Mount size", &limit.human_exact()));
         lines.push(detail_line(
             "Utilization",
-            &format!("{:.1}%", row.allocated.pct_of(limit)),
+            &format!("{:.1}%", node.allocated.pct_of(limit)),
         ));
     }
     lines
