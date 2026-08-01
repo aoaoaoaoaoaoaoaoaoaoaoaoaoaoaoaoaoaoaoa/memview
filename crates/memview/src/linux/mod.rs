@@ -8,7 +8,7 @@ mod ui;
 
 use app::{App, spawn_worker};
 use clap::Parser;
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, ensure};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
@@ -21,7 +21,9 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use state::UiStateStore;
-use std::io::{self, Stdout};
+use std::io::{self, IsTerminal, Stdout};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const FOCUSED_IDLE_POLL: Duration = Duration::from_millis(500);
@@ -40,6 +42,11 @@ pub type MainResult = Result<()>;
 pub fn run() -> MainResult {
     color_eyre::install()?;
     let cli = Cli::parse();
+    ensure!(
+        io::stdin().is_terminal() && io::stdout().is_terminal(),
+        "memview requires an interactive terminal on stdin and stdout"
+    );
+    let termination = TerminationFlag::install()?;
     let (commands, events) = spawn_worker(Duration::from_millis(cli.refresh_ms));
     let mut state_store = UiStateStore::discover();
     let mut terminal = TerminalGuard::enter()?;
@@ -53,7 +60,10 @@ pub fn run() -> MainResult {
     let mut dirty = true;
     let mut next_animated_redraw = Instant::now();
 
-    loop {
+    let termination_signal = loop {
+        if let Some(signal) = termination.pending() {
+            break Some(signal);
+        }
         while let Ok(event) = events.try_recv() {
             app.apply_worker_event(event, &commands);
             dirty = true;
@@ -67,7 +77,12 @@ pub fn run() -> MainResult {
             next_animated_redraw = Instant::now() + ANIMATED_REDRAW;
         }
 
-        if event::poll(poll_timeout(&app, next_animated_redraw))? {
+        let input_ready = match event::poll(poll_timeout(&app, next_animated_redraw)) {
+            Ok(input_ready) => input_ready,
+            Err(_) if termination.pending().is_some() => break termination.pending(),
+            Err(error) => return Err(error.into()),
+        };
+        if input_ready {
             match event::read()? {
                 Event::Key(key) => {
                     if key.kind != KeyEventKind::Press {
@@ -78,7 +93,7 @@ pub fn run() -> MainResult {
                         app.last_error = Some(warning);
                     }
                     if quit {
-                        break;
+                        break None;
                     }
                     dirty = true;
                 }
@@ -102,10 +117,42 @@ pub fn run() -> MainResult {
                 Event::Paste(_) => {}
             }
         }
-    }
+    };
 
     commands.shutdown();
+    drop(terminal);
+    if let Some(signal) = termination_signal {
+        std::process::exit(128 + signal);
+    }
     Ok(())
+}
+
+struct TerminationFlag(Arc<AtomicUsize>);
+
+impl TerminationFlag {
+    fn install() -> Result<Self> {
+        use signal_hook::consts::signal::{SIGHUP, SIGTERM};
+
+        let pending = Arc::new(AtomicUsize::new(0));
+        let _hangup = signal_hook::flag::register_usize(
+            SIGHUP,
+            Arc::clone(&pending),
+            usize::try_from(SIGHUP)?,
+        )?;
+        let _terminate = signal_hook::flag::register_usize(
+            SIGTERM,
+            Arc::clone(&pending),
+            usize::try_from(SIGTERM)?,
+        )?;
+        Ok(Self(pending))
+    }
+
+    #[must_use]
+    fn pending(&self) -> Option<i32> {
+        i32::try_from(self.0.load(Ordering::SeqCst))
+            .ok()
+            .filter(|signal| *signal != 0)
+    }
 }
 
 fn poll_timeout(app: &App, next_animated_redraw: Instant) -> Duration {

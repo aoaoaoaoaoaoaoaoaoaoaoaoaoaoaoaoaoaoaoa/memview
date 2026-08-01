@@ -11,7 +11,7 @@ use color_eyre::eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use rustix::fd::OwnedFd;
 use rustix::process::{Pid as KernelPid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
 
 mod ledgers;
@@ -52,6 +52,9 @@ impl Default for UiState {
 }
 
 impl TreeScope {
+    #[cfg(test)]
+    pub const ALL: [Self; 2] = [Self::SelfOnly, Self::SelfAndChildren];
+
     #[must_use]
     pub fn next(self) -> Self {
         match self {
@@ -65,6 +68,15 @@ impl TreeScope {
         match self {
             Self::SelfOnly => "self",
             Self::SelfAndChildren => "self+children",
+        }
+    }
+
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "self" => Some(Self::SelfOnly),
+            "self+children" => Some(Self::SelfAndChildren),
+            _ => None,
         }
     }
 
@@ -366,6 +378,31 @@ enum FoldTarget {
     Tmpfs(TmpfsStorageId),
 }
 
+#[derive(Clone, Copy)]
+enum Projection {
+    Processes = 0b001,
+    Tmpfs = 0b010,
+    Shared = 0b100,
+}
+
+#[derive(Default)]
+struct ProjectionDebt(u8);
+
+impl ProjectionDebt {
+    fn strike(&mut self, projection: Projection) {
+        self.0 |= projection as u8;
+    }
+
+    fn settle(&mut self, projection: Projection) {
+        self.0 &= !(projection as u8);
+    }
+
+    #[must_use]
+    fn owes(&self, projection: Projection) -> bool {
+        self.0 & projection as u8 != 0
+    }
+}
+
 impl<Key: Ord> FoldPolicy<'_, Key> {
     #[must_use]
     fn row_fold(&self, key: &Key, depth: usize, has_children: bool, total: Bytes) -> RowFold {
@@ -463,12 +500,13 @@ pub struct App {
     process_rows: PaneRows<FlatProcessRow>,
     tmpfs_rows: PaneRows<FlatTmpfsRow>,
     shared_rows: PaneRows<FlatSharedRow>,
+    projection_debt: ProjectionDebt,
     page_rows: PageRows,
     key_sequence: KeySequence,
 }
 
 enum Modal {
-    Help,
+    Help { scroll: u16 },
     Search(SearchDraft),
     Kill(KillConfirmation),
 }
@@ -558,6 +596,7 @@ impl App {
             process_rows: PaneRows::default(),
             tmpfs_rows: PaneRows::default(),
             shared_rows: PaneRows::default(),
+            projection_debt: ProjectionDebt::default(),
             page_rows: PageRows::default(),
             key_sequence: KeySequence::default(),
         }
@@ -625,7 +664,8 @@ impl App {
             Ok(ledger) => {
                 self.last_error = None;
                 self.ledgers.tmpfs = Some(*ledger);
-                self.rebuild_tmpfs_rows();
+                self.projection_debt.strike(Projection::Tmpfs);
+                self.project_current_pane();
             }
             Err(error) => self.last_error = Some(format!("{error:#}")),
         }
@@ -671,17 +711,21 @@ impl App {
 
     fn install_inventory(&mut self, ledger: Ledger<Inventory>) {
         self.ledgers.install_inventory(ledger);
+        self.projection_debt.strike(Projection::Tmpfs);
+        self.project_current_pane();
     }
 
     fn install_processes(&mut self, ledger: Ledger<Processes>) {
         self.ledgers.install_processes(ledger);
-        self.rebuild_process_rows();
-        self.retain_live_process_mappings();
+        self.projection_debt.strike(Projection::Processes);
+        self.project_current_pane();
+        self.process_mappings.clear();
     }
 
     fn install_shared(&mut self, ledger: Ledger<Shared>) {
         self.ledgers.install_shared(ledger);
-        self.rebuild_shared_rows();
+        self.projection_debt.strike(Projection::Shared);
+        self.project_current_pane();
     }
 
     #[must_use]
@@ -693,10 +737,27 @@ impl App {
                 || self.shared_scan_started_at.is_some())
     }
 
-    fn rebuild_filterable_rows(&mut self) {
-        self.rebuild_process_rows();
-        self.rebuild_tmpfs_rows();
-        self.rebuild_shared_rows();
+    fn strike_filterable_projections(&mut self) {
+        self.projection_debt.strike(Projection::Processes);
+        self.projection_debt.strike(Projection::Tmpfs);
+        self.projection_debt.strike(Projection::Shared);
+        self.project_current_pane();
+    }
+
+    fn project_current_pane(&mut self) {
+        match self.tab {
+            Tab::Overview => {}
+            Tab::Processes if self.projection_debt.owes(Projection::Processes) => {
+                self.rebuild_process_rows();
+            }
+            Tab::Tmpfs if self.projection_debt.owes(Projection::Tmpfs) => {
+                self.rebuild_tmpfs_rows();
+            }
+            Tab::Shared if self.projection_debt.owes(Projection::Shared) => {
+                self.rebuild_shared_rows();
+            }
+            Tab::Processes | Tab::Tmpfs | Tab::Shared => {}
+        }
     }
 
     #[must_use]
@@ -866,6 +927,7 @@ impl App {
         );
         self.process_search = summary;
         self.process_rows.install(rows);
+        self.projection_debt.settle(Projection::Processes);
     }
 
     fn rebuild_tmpfs_rows(&mut self) {
@@ -891,6 +953,7 @@ impl App {
         } else {
             self.tmpfs_rows.install_pinned_to_top(rows);
         }
+        self.projection_debt.settle(Projection::Tmpfs);
     }
 
     fn rebuild_shared_rows(&mut self) {
@@ -900,6 +963,7 @@ impl App {
         );
         self.shared_search = summary;
         self.shared_rows.install(rows);
+        self.projection_debt.settle(Projection::Shared);
     }
 
     #[must_use]
@@ -911,20 +975,28 @@ impl App {
     pub fn search_draft(&self) -> Option<&SearchDraft> {
         match &self.modal {
             Some(Modal::Search(draft)) => Some(draft),
-            Some(Modal::Help | Modal::Kill(_)) | None => None,
+            Some(Modal::Help { .. } | Modal::Kill(_)) | None => None,
         }
     }
 
     #[must_use]
     pub fn help_open(&self) -> bool {
-        matches!(self.modal, Some(Modal::Help))
+        matches!(self.modal, Some(Modal::Help { .. }))
+    }
+
+    #[must_use]
+    pub fn help_scroll(&self) -> u16 {
+        match self.modal {
+            Some(Modal::Help { scroll }) => scroll,
+            Some(Modal::Search(_) | Modal::Kill(_)) | None => 0,
+        }
     }
 
     #[must_use]
     pub fn kill_confirmation(&self) -> Option<&KillConfirmation> {
         match &self.modal {
             Some(Modal::Kill(confirmation)) => Some(confirmation),
-            Some(Modal::Help | Modal::Search(_)) | None => None,
+            Some(Modal::Help { .. } | Modal::Search(_)) | None => None,
         }
     }
 
@@ -1079,7 +1151,7 @@ impl App {
         match action {
             Action::Ignore => {}
             Action::Quit => return true,
-            Action::ShowHelp => self.modal = Some(Modal::Help),
+            Action::ShowHelp => self.modal = Some(Modal::Help { scroll: 0 }),
             Action::OpenSearch => self.open_search(),
             Action::ClearSearch => self.clear_search(),
             Action::NextTab => self.select_tab(self.tab.next(), commands),
@@ -1087,12 +1159,15 @@ impl App {
             Action::SelectTab(tab) => self.select_tab(tab, commands),
             Action::CycleMetric => {
                 self.metric = self.metric.next();
-                self.rebuild_process_rows();
-                self.rebuild_shared_rows();
+                self.projection_debt.strike(Projection::Processes);
+                self.projection_debt.strike(Projection::Shared);
+                self.project_current_pane();
             }
             Action::CycleScope => {
                 self.tree_scope = self.tree_scope.next();
-                self.rebuild_filterable_rows();
+                self.projection_debt.strike(Projection::Processes);
+                self.projection_debt.strike(Projection::Tmpfs);
+                self.project_current_pane();
             }
             Action::Kill => self.arm_process_kill(),
             Action::Refresh => self.refresh_current_pane(commands),
@@ -1137,6 +1212,7 @@ impl App {
 
     fn select_tab(&mut self, tab: Tab, commands: &WorkerPort) {
         self.tab = tab;
+        self.project_current_pane();
         if tab == Tab::Tmpfs {
             self.seize_tmpfs_selection();
         }
@@ -1152,7 +1228,10 @@ impl App {
         match self.tab {
             Tab::Overview => commands.refresh_inventory(),
             Tab::Processes => self.request_selected_process_mappings(commands),
-            Tab::Tmpfs => commands.refresh_tmpfs(),
+            Tab::Tmpfs => {
+                commands.refresh_inventory();
+                commands.refresh_tmpfs();
+            }
             Tab::Shared => commands.refresh_shared(),
         }
     }
@@ -1170,25 +1249,14 @@ impl App {
         }
     }
 
-    fn retain_live_process_mappings(&mut self) {
-        let Some(processes) = self.ledgers.process_data() else {
-            self.process_mappings.clear();
-            return;
-        };
-        let live = processes
-            .tree
-            .nodes
-            .iter()
-            .map(|node| node.key())
-            .collect::<BTreeSet<_>>();
-        self.process_mappings.retain(&live);
-    }
-
     fn refresh_current_pane(&mut self, commands: &WorkerPort) {
         match self.tab {
             Tab::Overview => commands.refresh_inventory(),
             Tab::Processes => commands.refresh_processes(),
-            Tab::Tmpfs => commands.refresh_tmpfs(),
+            Tab::Tmpfs => {
+                commands.refresh_inventory();
+                commands.refresh_tmpfs();
+            }
             Tab::Shared => commands.refresh_shared(),
         }
     }
@@ -1200,7 +1268,7 @@ impl App {
 
     fn clear_search(&mut self) {
         if self.search.take().is_some() {
-            self.rebuild_filterable_rows();
+            self.strike_filterable_projections();
         }
     }
 
@@ -1245,7 +1313,7 @@ impl App {
         match Search::compile(input.clone()) {
             Ok(search) => {
                 self.search = search;
-                self.rebuild_filterable_rows();
+                self.strike_filterable_projections();
             }
             Err(error) => {
                 let mut draft = SearchDraft::from_input(input);
@@ -1256,10 +1324,47 @@ impl App {
     }
 
     fn handle_help_key(&mut self, key: KeyEvent) -> bool {
+        let page = self.page_rows.0.min(usize::from(u16::MAX)) as u16;
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
             KeyCode::Esc | KeyCode::Char('?') => {
                 self.modal = None;
+                false
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(Modal::Help { scroll }) = self.modal.as_mut() {
+                    *scroll = scroll.saturating_sub(1);
+                }
+                false
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(Modal::Help { scroll }) = self.modal.as_mut() {
+                    *scroll = scroll.saturating_add(1);
+                }
+                false
+            }
+            KeyCode::PageUp => {
+                if let Some(Modal::Help { scroll }) = self.modal.as_mut() {
+                    *scroll = scroll.saturating_sub(page);
+                }
+                false
+            }
+            KeyCode::PageDown => {
+                if let Some(Modal::Help { scroll }) = self.modal.as_mut() {
+                    *scroll = scroll.saturating_add(page);
+                }
+                false
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                if let Some(Modal::Help { scroll }) = self.modal.as_mut() {
+                    *scroll = 0;
+                }
+                false
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                if let Some(Modal::Help { scroll }) = self.modal.as_mut() {
+                    *scroll = u16::MAX;
+                }
                 false
             }
             _ => false,

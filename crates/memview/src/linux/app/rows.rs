@@ -86,6 +86,7 @@ trait Forest {
 
     fn roots(&self) -> Vec<Self::Handle>;
     fn children(&self, handle: Self::Handle) -> Vec<Self::Handle>;
+    fn largest_non_root_subtree(&self) -> Bytes;
     fn key(&self, handle: Self::Handle) -> Self::Key;
     fn direct_value(&self, handle: Self::Handle) -> Bytes;
     fn total_value(&self, handle: Self::Handle) -> Bytes;
@@ -194,7 +195,8 @@ fn push_contextual_matches<F: Forest>(
     summary: &mut SearchSummary,
 ) -> bool {
     let direct = forest.matches(search, handle);
-    let mut child_rows = Vec::new();
+    let row_index = rows.len();
+    rows.push(forest.row(handle, depth, RowFold::Leaf, SearchRole::Ordinary));
     let mut child_visible = false;
     for child in forest.children(handle) {
         child_visible |= push_contextual_matches(
@@ -203,7 +205,7 @@ fn push_contextual_matches<F: Forest>(
             depth + 1,
             search,
             covered_by_match || direct,
-            &mut child_rows,
+            rows,
             summary,
         );
     }
@@ -215,7 +217,7 @@ fn push_contextual_matches<F: Forest>(
     }
     let visible = direct || child_visible;
     if visible {
-        rows.push(forest.row(
+        rows[row_index] = forest.row(
             handle,
             depth,
             if child_visible {
@@ -228,31 +230,15 @@ fn push_contextual_matches<F: Forest>(
             } else {
                 SearchRole::Context
             },
-        ));
-        rows.extend(child_rows);
+        );
+    } else {
+        rows.truncate(row_index);
     }
     visible
 }
 
 fn largest_non_root_subtree<F: Forest>(forest: &F) -> Bytes {
-    forest
-        .roots()
-        .into_iter()
-        .flat_map(|root| forest.children(root))
-        .map(|child| largest_subtree(forest, child))
-        .max()
-        .unwrap_or(Bytes::ZERO)
-}
-
-fn largest_subtree<F: Forest>(forest: &F, handle: F::Handle) -> Bytes {
-    let children = forest.children(handle);
-    let child_max = children
-        .iter()
-        .copied()
-        .map(|child| largest_subtree(forest, child))
-        .max()
-        .unwrap_or(Bytes::ZERO);
-    child_max.max(forest.total_value(handle))
+    forest.largest_non_root_subtree()
 }
 
 struct ProcessForest<'a> {
@@ -292,6 +278,18 @@ impl Forest for ProcessForest<'_> {
         let mut children = self.node(handle).children.clone();
         self.sort(&mut children);
         children
+    }
+
+    fn largest_non_root_subtree(&self) -> Bytes {
+        self.processes
+            .tree
+            .roots
+            .iter()
+            .flat_map(|root| self.node(*root).children.iter())
+            .copied()
+            .map(|child| self.total_value(child))
+            .max()
+            .unwrap_or(Bytes::ZERO)
     }
 
     fn key(&self, handle: Self::Handle) -> Self::Key {
@@ -388,6 +386,21 @@ impl<'a> Forest for TmpfsForest<'a> {
                 node: self.tmpfs.mounts[handle.mount_index].node(*node_id),
             })
             .collect()
+    }
+
+    fn largest_non_root_subtree(&self) -> Bytes {
+        self.tmpfs
+            .mounts
+            .iter()
+            .flat_map(|mount| {
+                mount
+                    .root()
+                    .children
+                    .iter()
+                    .map(|id| mount.node(*id).allocated)
+            })
+            .max()
+            .unwrap_or(Bytes::ZERO)
     }
 
     fn key(&self, handle: Self::Handle) -> Self::Key {

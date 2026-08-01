@@ -2,12 +2,31 @@ use super::app::{TreeScope, UiState};
 use super::model::Metric;
 use super::nav::Tab;
 use std::env;
+use std::fmt::{self, Display, Formatter};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 const STATE_VERSION: &str = "v1";
+const STATE_VERSION_NUMBER: u64 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DecodeError {
+    Invalid(&'static str),
+    FutureVersion(u64),
+}
+
+impl Display for DecodeError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(problem) => formatter.write_str(problem),
+            Self::FutureVersion(version) => {
+                write!(formatter, "state belongs to newer format v{version}")
+            }
+        }
+    }
+}
 
 trait StateAtom: Copy + Sized {
     const UNKNOWN: &'static str;
@@ -16,42 +35,40 @@ trait StateAtom: Copy + Sized {
     fn parse(token: &str) -> Option<Self>;
 }
 
-macro_rules! state_atoms {
-    ($($ty:ty, $unknown:literal => {$($variant:path = $token:literal),+ $(,)?});+ $(;)?) => {
-        $(impl StateAtom for $ty {
-            const UNKNOWN: &'static str = $unknown;
+impl StateAtom for Tab {
+    const UNKNOWN: &'static str = "unknown pane";
 
-            fn token(self) -> &'static str {
-                match self {$($variant => $token),+}
-            }
+    fn token(self) -> &'static str {
+        self.token()
+    }
 
-            fn parse(token: &str) -> Option<Self> {
-                match token {$($token => Some($variant),)+ _ => None}
-            }
-        })+
-    };
+    fn parse(token: &str) -> Option<Self> {
+        Self::from_token(token)
+    }
 }
 
-state_atoms! {
-    Tab, "unknown pane" => {
-        Tab::Overview = "overview",
-        Tab::Processes = "processes",
-        Tab::Tmpfs = "tmpfs",
-        Tab::Shared = "shared",
-    };
-    Metric, "unknown metric" => {
-        Metric::Pss = "pss",
-        Metric::Uss = "uss",
-        Metric::Rss = "rss",
-        Metric::SwapPss = "swap-pss",
-        Metric::Anonymous = "anonymous",
-        Metric::File = "file",
-        Metric::Shmem = "shmem",
-    };
-    TreeScope, "unknown tree scope" => {
-        TreeScope::SelfOnly = "self",
-        TreeScope::SelfAndChildren = "self+children",
-    };
+impl StateAtom for Metric {
+    const UNKNOWN: &'static str = "unknown metric";
+
+    fn token(self) -> &'static str {
+        self.token()
+    }
+
+    fn parse(token: &str) -> Option<Self> {
+        Self::from_token(token)
+    }
+}
+
+impl StateAtom for TreeScope {
+    const UNKNOWN: &'static str = "unknown tree scope";
+
+    fn token(self) -> &'static str {
+        self.label()
+    }
+
+    fn parse(token: &str) -> Option<Self> {
+        Self::from_token(token)
+    }
 }
 
 pub struct UiStateStore {
@@ -90,15 +107,19 @@ impl UiStateStore {
                     restored,
                     warning: None,
                 },
-                Err(problem) => Self {
-                    warning: Some(format!(
-                        "ignored invalid UI state at {}: {problem}",
-                        path.display()
-                    )),
-                    path: Some(path),
-                    persisted: None,
-                    restored: UiState::default(),
-                },
+                Err(problem) => {
+                    let writable = !matches!(problem, DecodeError::FutureVersion(_));
+                    Self {
+                        warning: Some(format!(
+                            "ignored invalid UI state at {}: {problem}{}",
+                            path.display(),
+                            if writable { "" } else { "; file preserved" }
+                        )),
+                        path: writable.then_some(path),
+                        persisted: None,
+                        restored: UiState::default(),
+                    }
+                }
             },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self {
                 path: Some(path),
@@ -193,7 +214,7 @@ fn encode(state: UiState) -> String {
     )
 }
 
-fn decode(encoded: &str) -> Result<UiState, &'static str> {
+fn decode(encoded: &str) -> Result<UiState, DecodeError> {
     let mut fields = encoded.split_ascii_whitespace();
     let (Some(version), Some(tab), Some(metric), Some(scope), None) = (
         fields.next(),
@@ -202,10 +223,20 @@ fn decode(encoded: &str) -> Result<UiState, &'static str> {
         fields.next(),
         fields.next(),
     ) else {
-        return Err("expected four fields");
+        return Err(DecodeError::Invalid("expected four fields"));
     };
     if version != STATE_VERSION {
-        return Err("unsupported state version");
+        let Some(version) = version
+            .strip_prefix('v')
+            .and_then(|version| version.parse::<u64>().ok())
+        else {
+            return Err(DecodeError::Invalid("malformed state version"));
+        };
+        return if version > STATE_VERSION_NUMBER {
+            Err(DecodeError::FutureVersion(version))
+        } else {
+            Err(DecodeError::Invalid("unsupported state version"))
+        };
     }
     Ok(UiState {
         tab: decode_atom(tab)?,
@@ -214,8 +245,8 @@ fn decode(encoded: &str) -> Result<UiState, &'static str> {
     })
 }
 
-fn decode_atom<T: StateAtom>(token: &str) -> Result<T, &'static str> {
-    T::parse(token).ok_or(T::UNKNOWN)
+fn decode_atom<T: StateAtom>(token: &str) -> Result<T, DecodeError> {
+    T::parse(token).ok_or(DecodeError::Invalid(T::UNKNOWN))
 }
 
 #[cfg(test)]
@@ -224,19 +255,9 @@ mod tests {
 
     #[test]
     fn codec_spans_the_closed_ui_state_product() {
-        let metrics = [
-            Metric::Pss,
-            Metric::Uss,
-            Metric::Rss,
-            Metric::SwapPss,
-            Metric::Anonymous,
-            Metric::File,
-            Metric::Shmem,
-        ];
-        let scopes = [TreeScope::SelfOnly, TreeScope::SelfAndChildren];
         for tab in Tab::ALL {
-            for metric in metrics {
-                for tree_scope in scopes {
+            for metric in Metric::ALL {
+                for tree_scope in TreeScope::ALL {
                     let state = UiState {
                         tab,
                         metric,
@@ -265,10 +286,33 @@ mod tests {
     fn malformed_state_is_rejected() {
         assert_eq!(
             decode("v2 processes pss self"),
-            Err("unsupported state version")
+            Err(DecodeError::FutureVersion(2))
         );
-        assert_eq!(decode("v1 process pss self"), Err("unknown pane"));
-        assert_eq!(decode("v1 processes pss"), Err("expected four fields"));
+        assert_eq!(
+            decode("v1 process pss self"),
+            Err(DecodeError::Invalid("unknown pane"))
+        );
+        assert_eq!(
+            decode("v1 processes pss"),
+            Err(DecodeError::Invalid("expected four fields"))
+        );
+    }
+
+    #[test]
+    fn future_state_is_never_overwritten() {
+        let root = env::temp_dir().join(format!("memview-future-state-{}", std::process::id()));
+        let path = root.join("memview/ui-state");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(path.parent().expect("test state parent")).expect("create test state");
+        fs::write(&path, "v99 processes pss self\n").expect("write future state");
+
+        let mut store = UiStateStore::restore(path.clone());
+        assert!(store.sync(UiState::default()).is_none());
+        assert_eq!(
+            fs::read_to_string(&path).expect("read preserved state"),
+            "v99 processes pss self\n"
+        );
+        fs::remove_dir_all(root).expect("remove test state");
     }
 
     #[test]

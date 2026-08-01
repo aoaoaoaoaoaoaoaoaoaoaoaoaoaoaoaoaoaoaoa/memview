@@ -10,6 +10,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
+use std::borrow::Cow;
 use std::time::Duration;
 
 const BG: Color = Color::Rgb(12, 17, 24);
@@ -95,7 +96,7 @@ fn header(app: &App) -> Paragraph<'static> {
         .style(Style::default().fg(FG).bg(BG))
 }
 
-fn footer(app: &App) -> Paragraph<'static> {
+fn footer(app: &App) -> Paragraph<'_> {
     let mut spans = Vec::new();
     if let Some(pattern) = app.search_pattern() {
         spans.push(Span::styled(
@@ -123,7 +124,7 @@ fn footer(app: &App) -> Paragraph<'static> {
     ));
     if let Some(error) = &app.last_error {
         spans.push(Span::styled("  last error: ", Style::default().fg(HOT)));
-        spans.push(Span::styled(error.clone(), Style::default().fg(HOT)));
+        spans.push(Span::styled(error.as_str(), Style::default().fg(HOT)));
     }
     if let Some(confirmation) = app.kill_confirmation() {
         if confirmation.armed() {
@@ -161,10 +162,12 @@ fn footer(app: &App) -> Paragraph<'static> {
             Style::default().fg(MUTED),
         ));
     }
-    Paragraph::new(Line::from(spans)).style(Style::default().bg(BG))
+    Paragraph::new(Line::from(spans))
+        .wrap(Wrap { trim: false })
+        .style(Style::default().bg(BG))
 }
 
-fn push_footer_hint(spans: &mut Vec<Span<'static>>, hint: FooterHint) {
+fn push_footer_hint(spans: &mut Vec<Span<'_>>, hint: FooterHint) {
     spans.push(Span::styled(hint.key, Style::default().fg(FOOTER_KEY)));
     spans.push(Span::raw(" "));
     spans.push(Span::styled(hint.action, Style::default().fg(MUTED)));
@@ -378,12 +381,7 @@ fn render_overview(frame: &mut Frame<'_>, app: &App, area: Rect) {
         warnings
             .iter()
             .take(24)
-            .map(|warning| {
-                Line::from(Span::styled(
-                    (*warning).to_string(),
-                    Style::default().fg(HOT),
-                ))
-            })
+            .map(|warning| Line::from(Span::styled(*warning, Style::default().fg(HOT))))
             .collect::<Vec<_>>()
     };
     frame.render_widget(
@@ -459,7 +457,7 @@ fn render_processes(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .header(header_row([
             "Task", "PID", "User", "PSS", "USS", "RSS", "Command",
         ]))
-        .block(panel(&format!("process tree ({})", app.tree_scope.label())))
+        .block(panel(format!("process tree ({})", app.tree_scope.label())))
         .column_spacing(1),
         columns[0],
     );
@@ -474,38 +472,38 @@ fn render_processes(frame: &mut Frame<'_>, app: &App, area: Rect) {
             details.push(detail_line("CWD", cwd.as_str()));
         }
         details.extend([
-            detail_line("State", &process.state),
-            detail_line("Threads", &process.threads.to_string()),
+            detail_line("State", process.state.as_str()),
+            detail_line("Threads", process.threads.to_string()),
         ]);
         match process.memory {
             ProcessMemory::Smaps(rollup) => details.extend([
-                detail_line("PSS", &rollup.pss.human_exact()),
-                detail_line("USS", &rollup.uss().human_exact()),
-                detail_line("RSS", &rollup.rss.human_exact()),
-                detail_line("PSS anon", &rollup.pss_anon.human_exact()),
-                detail_line("PSS file", &rollup.pss_file.human_exact()),
-                detail_line("PSS shmem", &rollup.pss_shmem.human_exact()),
-                detail_line("SwapPSS", &rollup.swap_pss.human_exact()),
+                detail_line("PSS", rollup.pss.human_exact()),
+                detail_line("USS", rollup.uss().human_exact()),
+                detail_line("RSS", rollup.rss.human_exact()),
+                detail_line("PSS anon", rollup.pss_anon.human_exact()),
+                detail_line("PSS file", rollup.pss_file.human_exact()),
+                detail_line("PSS shmem", rollup.pss_shmem.human_exact()),
+                detail_line("SwapPSS", rollup.swap_pss.human_exact()),
             ]),
             ProcessMemory::Status(status) => details.extend([
                 detail_line("PSS / USS", "unavailable"),
-                detail_line("Status RSS", &status.rss.human_exact()),
-                detail_line("RSS anon", &status.anonymous.human_exact()),
-                detail_line("RSS file", &status.file.human_exact()),
-                detail_line("RSS shmem", &status.shmem.human_exact()),
-                detail_line("Status swap", &status.swap.human_exact()),
+                detail_line("Status RSS", status.rss.human_exact()),
+                detail_line("RSS anon", status.anonymous.human_exact()),
+                detail_line("RSS file", status.file.human_exact()),
+                detail_line("RSS shmem", status.shmem.human_exact()),
+                detail_line("Status swap", status.swap.human_exact()),
             ]),
         }
         details.extend([
             detail_line(
                 "Access",
-                &format!(
+                format!(
                     "rollup={} maps={}",
                     process.rollup_state().label(),
                     app.selected_process_mapping_status()
                 ),
             ),
-            detail_line("Map scan", &app.selected_process_mapping_scan_label()),
+            detail_line("Map scan", app.selected_process_mapping_scan_label()),
         ]);
         frame.render_widget(
             Paragraph::new(details)
@@ -528,7 +526,8 @@ fn render_processes(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame.render_widget(mapping_loading(pid, elapsed), right[1]);
     } else {
         let objects = app.selected_process_objects();
-        let object_rows = slice_window(objects, 0, right[1].height.saturating_sub(4) as usize)
+        let object_window = slice_window(objects, 0, right[1].height.saturating_sub(4) as usize);
+        let object_rows = object_window
             .iter()
             .map(|object| row_object_usage(object, capacity))
             .collect::<Vec<_>>();
@@ -613,7 +612,7 @@ fn render_tmpfs(frame: &mut Frame<'_>, app: &App, area: Rect) {
             "Logical",
             "Path",
         ]))
-        .block(panel(&format!(
+        .block(panel(format!(
             "tmpfs generation ({}/{} filesystems; {} walk gaps)",
             tmpfs.coverage.captured_filesystems,
             tmpfs.coverage.unique_filesystems,
@@ -680,7 +679,7 @@ fn render_shared(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .header(header_row([
             "Kind", "Tasks", "PSS", "RSS", "VMAs", "Object",
         ]))
-        .block(panel(&format!(
+        .block(panel(format!(
             "backing ledger ({}/{} maps exact)",
             shared.coverage.exact_maps, shared.coverage.captured
         )))
@@ -696,16 +695,16 @@ fn render_shared(frame: &mut Frame<'_>, app: &App, area: Rect) {
         let mut summary = search_summary_lines(app, capacity);
         summary.extend([
             Line::from(Span::styled(
-                object.label.clone(),
+                object.label.as_str(),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             )),
             detail_line("Kind", object.kind.label()),
-            detail_line("Backing", &object.backing.to_string()),
-            detail_line("PSS", &object.rollup.pss.human_exact()),
-            detail_line("RSS", &object.rollup.rss.human_exact()),
-            detail_line("Swap", &object.rollup.swap.human_exact()),
-            detail_line("Tasks", &object.mapped_processes.to_string()),
-            detail_line("VMAs", &object.regions.to_string()),
+            detail_line("Backing", object.backing.to_string()),
+            detail_line("PSS", object.rollup.pss.human_exact()),
+            detail_line("RSS", object.rollup.rss.human_exact()),
+            detail_line("Swap", object.rollup.swap.human_exact()),
+            detail_line("Tasks", object.mapped_processes.to_string()),
+            detail_line("VMAs", object.regions.to_string()),
         ]);
         frame.render_widget(
             Paragraph::new(summary)
@@ -715,23 +714,24 @@ fn render_shared(frame: &mut Frame<'_>, app: &App, area: Rect) {
             right[0],
         );
 
-        let consumers = slice_window(
+        let consumer_window = slice_window(
             &object.consumers,
             0,
             right[1].height.saturating_sub(4) as usize,
-        )
-        .iter()
-        .map(|consumer| {
-            Row::new(vec![
-                Cell::from(consumer.pid.to_string()),
-                usage_cell(consumer.rollup.pss, capacity),
-                usage_cell(consumer.rollup.rss, capacity),
-                Cell::from(consumer.name.clone()),
-                Cell::from(consumer.command.clone()),
-            ])
-            .style(usage_style(false, consumer.rollup.pss, capacity))
-        })
-        .collect::<Vec<_>>();
+        );
+        let consumers = consumer_window
+            .iter()
+            .map(|consumer| {
+                Row::new(vec![
+                    Cell::from(consumer.pid.to_string()),
+                    usage_cell(consumer.rollup.pss, capacity),
+                    usage_cell(consumer.rollup.rss, capacity),
+                    Cell::from(consumer.name.as_str()),
+                    Cell::from(consumer.command.as_str()),
+                ])
+                .style(usage_style(false, consumer.rollup.pss, capacity))
+            })
+            .collect::<Vec<_>>();
         frame.render_widget(
             Table::new(
                 consumers,
@@ -759,11 +759,11 @@ fn render_shared(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 }
 
-fn row_meminfo(entry: &MeminfoEntry, meminfo: &Meminfo) -> Row<'static> {
+fn row_meminfo<'a>(entry: &'a MeminfoEntry, meminfo: &Meminfo) -> Row<'a> {
     let total = meminfo.value("MemTotal").unwrap_or(Bytes::ZERO);
     let color = MeminfoTone::for_key(&entry.key).color(entry.value, meminfo);
     Row::new(vec![
-        Cell::from(entry.key.clone()),
+        Cell::from(entry.key.as_str()),
         Cell::from(entry.value.human_iec()).style(Style::default().fg(color)),
         Cell::from(format!("{:.1}", entry.value.pct_of(total))).style(Style::default().fg(color)),
     ])
@@ -793,13 +793,13 @@ fn summary_text_row(label: &str, value: &str) -> Row<'static> {
     ])
 }
 
-fn row_process(
+fn row_process<'a>(
     app: &App,
-    processes: &Processes,
+    processes: &'a Processes,
     row: &FlatProcessRow,
     selected: bool,
     capacity: Bytes,
-) -> Row<'static> {
+) -> Row<'a> {
     let node = &processes.tree.nodes[row.index];
     let rollup = app.tree_scope.rollup(node);
     let marker = match row.fold {
@@ -811,11 +811,11 @@ fn row_process(
     Row::new(vec![
         Cell::from(name),
         Cell::from(node.pid.to_string()),
-        Cell::from(node.username.clone()),
+        Cell::from(node.username.as_str()),
         usage_cell(rollup.pss, capacity),
         usage_cell(rollup.uss(), capacity),
         usage_cell(rollup.rss, capacity),
-        Cell::from(node.command.clone()),
+        Cell::from(node.command.as_str()),
     ])
     .style(usage_style_for_role(
         selected,
@@ -825,12 +825,12 @@ fn row_process(
     ))
 }
 
-fn row_tmpfs(
-    tmpfs: &super::model::Tmpfs,
+fn row_tmpfs<'a>(
+    tmpfs: &'a super::model::Tmpfs,
     row: &FlatTmpfsRow,
     selected: bool,
     capacity: Bytes,
-) -> Row<'static> {
+) -> Row<'a> {
     let mount = &tmpfs.mounts[row.mount_index];
     let node = mount.node(row.node_id);
     let marker = match row.fold {
@@ -846,10 +846,10 @@ fn row_tmpfs(
     let label = format!("{}{} {name}", "  ".repeat(row.depth), marker);
     Row::new(vec![
         Cell::from(label),
-        Cell::from(node.kind.label().to_string()),
+        Cell::from(node.kind.label()),
         usage_cell(node.allocated, capacity),
         usage_cell(node.logical, capacity),
-        Cell::from(node.path.display().to_string()),
+        Cell::from(node.path.to_string_lossy()),
     ])
     .style(usage_style_for_role(
         selected,
@@ -859,21 +859,21 @@ fn row_tmpfs(
     ))
 }
 
-fn row_shared(
-    shared: &Shared,
+fn row_shared<'a>(
+    shared: &'a Shared,
     row: &FlatSharedRow,
     selected: bool,
     capacity: Bytes,
     metric: super::model::Metric,
-) -> Row<'static> {
+) -> Row<'a> {
     let object = &shared.objects[row.index];
     Row::new(vec![
-        Cell::from(object.kind.label().to_string()),
+        Cell::from(object.kind.label()),
         Cell::from(object.mapped_processes.to_string()),
         usage_cell(object.rollup.pss, capacity),
         usage_cell(object.rollup.rss, capacity),
         Cell::from(object.regions.to_string()),
-        Cell::from(object.label.clone()),
+        Cell::from(object.label.as_str()),
     ])
     .style(usage_style_for_role(
         selected,
@@ -883,40 +883,43 @@ fn row_shared(
     ))
 }
 
-fn row_object_usage(object: &ObjectUsage, capacity: Bytes) -> Row<'static> {
+fn row_object_usage(object: &ObjectUsage, capacity: Bytes) -> Row<'_> {
     Row::new(vec![
-        Cell::from(object.kind.label().to_string()),
+        Cell::from(object.kind.label()),
         usage_cell(object.rollup.pss, capacity),
         usage_cell(object.rollup.rss, capacity),
         Cell::from(object.regions.to_string()),
-        Cell::from(object.label.clone()),
+        Cell::from(object.label.as_str()),
     ])
     .style(usage_style(false, object.rollup.pss, capacity))
 }
 
-fn tmpfs_detail_lines(mount: &TmpfsMount, node: &super::model::TmpfsNode) -> Vec<Line<'static>> {
+fn tmpfs_detail_lines<'a>(
+    mount: &'a TmpfsMount,
+    node: &'a super::model::TmpfsNode,
+) -> Vec<Line<'a>> {
     let mut lines = vec![
         Line::from(Span::styled(
-            node.path.display().to_string(),
+            node.path.to_string_lossy(),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
-        detail_line("Mount", &mount.mount_point.display().to_string()),
-        detail_line("Source", &mount.source),
+        detail_line("Mount", mount.mount_point.to_string_lossy()),
+        detail_line("Source", mount.source.as_str()),
         detail_line("Kind", node.kind.label()),
-        detail_line("Allocated", &node.allocated.human_exact()),
-        detail_line("Logical", &node.logical.human_exact()),
+        detail_line("Allocated", node.allocated.human_exact()),
+        detail_line("Logical", node.logical.human_exact()),
     ];
     if let Some(limit) = mount.size_limit {
-        lines.push(detail_line("Mount size", &limit.human_exact()));
+        lines.push(detail_line("Mount size", limit.human_exact()));
         lines.push(detail_line(
             "Utilization",
-            &format!("{:.1}%", node.allocated.pct_of(limit)),
+            format!("{:.1}%", node.allocated.pct_of(limit)),
         ));
     }
     lines
 }
 
-fn search_summary_lines(app: &App, capacity: Bytes) -> Vec<Line<'static>> {
+fn search_summary_lines(app: &App, capacity: Bytes) -> Vec<Line<'_>> {
     let Some(summary) = app.search_summary() else {
         return Vec::new();
     };
@@ -926,12 +929,12 @@ fn search_summary_lines(app: &App, capacity: Bytes) -> Vec<Line<'static>> {
             "regexp matches",
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
         )),
-        detail_line("regexp", &format!("/{pattern}/")),
-        detail_line("matches", &summary.matches.to_string()),
-        detail_line(summary.lens, &summary.total.human_exact()),
+        detail_line("regexp", format!("/{pattern}/")),
+        detail_line("matches", summary.matches.to_string()),
+        detail_line(summary.lens, summary.total.human_exact()),
         detail_line(
             "pct total",
-            &format!("{:.2}%", summary.total.pct_of(capacity)),
+            format!("{:.2}%", summary.total.pct_of(capacity)),
         ),
     ];
     if matches!(app.tab, super::app::Tab::Processes | super::app::Tab::Tmpfs) {
@@ -941,20 +944,16 @@ fn search_summary_lines(app: &App, capacity: Bytes) -> Vec<Line<'static>> {
     lines
 }
 
-fn detail_line(label: &str, value: &str) -> Line<'static> {
+fn detail_line<'a>(label: &str, value: impl Into<Cow<'a, str>>) -> Line<'a> {
     Line::from(vec![
         Span::styled(format!("{label:>12} "), Style::default().fg(MUTED)),
-        Span::styled(value.to_string(), Style::default().fg(FG)),
+        Span::styled(value.into(), Style::default().fg(FG)),
     ])
 }
 
-fn header_row<const N: usize>(values: [&str; N]) -> Row<'static> {
-    Row::new(
-        values
-            .into_iter()
-            .map(|value| Cell::from(value.to_string())),
-    )
-    .style(Style::default().fg(GOLD).add_modifier(Modifier::BOLD))
+fn header_row<const N: usize>(values: [&'static str; N]) -> Row<'static> {
+    Row::new(values.into_iter().map(Cell::from))
+        .style(Style::default().fg(GOLD).add_modifier(Modifier::BOLD))
 }
 
 fn usage_style(selected: bool, value: Bytes, total: Bytes) -> Style {
@@ -1058,16 +1057,23 @@ fn blend_channel(start: u8, end: u8, t: f64) -> u8 {
         .clamp(0.0, 255.0) as u8
 }
 
-fn panel(title: &str) -> Block<'static> {
+fn panel<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
     Block::default()
         .borders(Borders::ALL)
-        .title(title.to_string())
+        .title(title)
         .style(Style::default().fg(FG).bg(BG))
 }
 
 fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let popup = centered_rect(area, 82, 88);
+    let popup = centered_rect(area, 92, 92);
     frame.render_widget(Clear, popup);
+    let block = panel("Help");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
     let bindings = app.binding_sections();
     let mut text = vec![
         Line::from(Span::styled(
@@ -1095,21 +1101,44 @@ fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
             "NVIDIA system pools appear as an independent lens when shrinker debugfs is readable; \
              they are not subtracted because the kernel snapshots can overlap or race.",
         ),
-        Line::from("Processes uses PSS so shared pages are not double-counted."),
+        Line::from(
+            "PSS lenses remain zero for tasks readable only through status RSS; coverage reports \
+             the degradation.",
+        ),
         Line::from(
             "Tmpfs uses allocated blocks, which is closer to actual backing than file length.",
         ),
         Line::from("Tree panes auto-fold subtrees below min(1% RAM, 3% largest non-root subtree)."),
         Line::from(
-            "Shared aggregates mapped objects across tasks: tmpfs, memfd, SYSV, files, and anon.",
+            "Shared aggregates mapped objects across visible tasks: tmpfs, memfd, SYSV, files, \
+             and anonymous regions.",
         ),
     ]);
+    let paragraph = Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .style(Style::default().fg(FG));
+    let line_count = paragraph.line_count(sections[0].width);
+    let max_scroll = line_count
+        .saturating_sub(usize::from(sections[0].height))
+        .min(usize::from(u16::MAX)) as u16;
+    let scroll = app.help_scroll().min(max_scroll);
+    frame.render_widget(paragraph.scroll((scroll, 0)), sections[0]);
     frame.render_widget(
-        Paragraph::new(text)
-            .block(panel("Help"))
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(FG)),
-        popup,
+        Paragraph::new(Line::from(vec![
+            Span::styled("↑/↓ PgUp/PgDn Home/End", Style::default().fg(FOOTER_KEY)),
+            Span::raw(" scroll  "),
+            Span::styled("Esc/?", Style::default().fg(FOOTER_KEY)),
+            Span::raw(" close  "),
+            Span::styled(
+                format!(
+                    "line {}/{}",
+                    scroll.saturating_add(1),
+                    max_scroll.saturating_add(1)
+                ),
+                Style::default().fg(MUTED),
+            ),
+        ])),
+        sections[1],
     );
 }
 
@@ -1150,8 +1179,8 @@ fn render_kill_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Style::default().fg(HOT).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        detail_line("PID", &confirmation.target.pid.to_string()),
-        detail_line("Name", &confirmation.target.name),
+        detail_line("PID", confirmation.target.pid.to_string()),
+        detail_line("Name", confirmation.target.name.as_str()),
     ];
     frame.render_widget(
         Paragraph::new(top).style(Style::default().fg(FG)),
@@ -1159,7 +1188,7 @@ fn render_kill_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 
     frame.render_widget(
-        Paragraph::new(confirmation.target.cli().to_string())
+        Paragraph::new(confirmation.target.cli())
             .block(
                 Block::default()
                     .borders(Borders::TOP | Borders::BOTTOM)
@@ -1180,7 +1209,7 @@ fn render_kill_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         controls.push(detail_line(
             "lockout",
-            &format!(
+            format!(
                 "{} ms before y is accepted",
                 confirmation.lock_remaining().as_millis()
             ),
@@ -1284,7 +1313,13 @@ fn slice_window<T>(items: &[T], selected: usize, height: usize) -> SliceWindow<'
 
 #[cfg(test)]
 mod tests {
+    use super::super::app::{UiState, WorkerPort};
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::sync::mpsc;
+
     fn meminfo(total: Bytes) -> Meminfo {
         Meminfo {
             entries: vec![MeminfoEntry {
@@ -1320,5 +1355,39 @@ mod tests {
             MeminfoTone::Pressure.color(Bytes(0), &meminfo),
             usage_color(Bytes(0), Bytes(100))
         );
+    }
+
+    #[test]
+    fn ordinary_terminal_help_reaches_every_note() {
+        let (requests, _events) = mpsc::channel();
+        let commands = WorkerPort::process_harness(requests);
+        let mut app = App::new(UiState::default());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        let _ = app.handle_key(
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            &commands,
+        );
+        let _ = terminal
+            .draw(|frame| render(frame, &app))
+            .expect("render help start");
+        assert!(buffer_text(terminal.backend().buffer()).contains("Global"));
+
+        let _ = app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), &commands);
+        let _ = terminal
+            .draw(|frame| render(frame, &app))
+            .expect("render help end");
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("anonymous regions"));
+        assert!(text.contains("Home/End"));
+    }
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let width = usize::from(buffer.area.width);
+        buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

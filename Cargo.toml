@@ -2,6 +2,9 @@
 members = ["crates/memview"]
 resolver = "3"
 
+[profile.release]
+strip = "symbols"
+
 [workspace.package]
 edition = "2024"
 license = "MIT"

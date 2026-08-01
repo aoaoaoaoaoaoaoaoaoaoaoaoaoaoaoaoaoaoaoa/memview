@@ -1,61 +1,94 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Tab {
-    Overview,
-    Processes,
-    Tmpfs,
-    Shared,
+macro_rules! tab_catalog {
+    ($($variant:ident => {
+        title: $title:literal,
+        token: $token:literal,
+        scans: $scans:literal,
+        navigation: $navigation:expr,
+        bindings: $bindings:expr
+    }),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        #[repr(u8)]
+        pub enum Tab {$($variant),+}
+
+        impl Tab {
+            pub const ALL: [Self; tab_catalog!(@count $($variant)+)] = [$(Self::$variant),+];
+
+            #[must_use]
+            pub fn next(self) -> Self {
+                Self::ALL[(self as usize + 1) % Self::ALL.len()]
+            }
+
+            #[must_use]
+            pub fn previous(self) -> Self {
+                Self::ALL[(self as usize + Self::ALL.len() - 1) % Self::ALL.len()]
+            }
+
+            #[must_use]
+            pub fn title(self) -> &'static str {
+                match self {$(Self::$variant => $title),+}
+            }
+
+            #[must_use]
+            pub fn token(self) -> &'static str {
+                match self {$(Self::$variant => $token),+}
+            }
+
+            #[must_use]
+            pub fn from_token(token: &str) -> Option<Self> {
+                match token {$($token => Some(Self::$variant),)+ _ => None}
+            }
+
+            #[must_use]
+            pub fn drives_process_scans(self) -> bool {
+                match self {$(Self::$variant => $scans),+}
+            }
+
+            #[must_use]
+            pub fn bindings(self) -> &'static [Binding] {
+                match self {$(Self::$variant => $bindings),+}
+            }
+
+            #[must_use]
+            pub fn navigation(self) -> &'static [Binding] {
+                match self {$(Self::$variant => $navigation),+}
+            }
+        }
+    };
+    (@count $head:ident $($tail:ident)*) => {1usize $(+ tab_catalog!(@one $tail))*};
+    (@one $variant:ident) => {1usize};
 }
 
-impl Tab {
-    pub const ALL: [Self; 4] = [Self::Overview, Self::Processes, Self::Tmpfs, Self::Shared];
-
-    #[must_use]
-    pub fn next(self) -> Self {
-        let index = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
-        Self::ALL[(index + 1) % Self::ALL.len()]
-    }
-
-    #[must_use]
-    pub fn previous(self) -> Self {
-        let index = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
-        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
-    }
-
-    #[must_use]
-    pub fn title(self) -> &'static str {
-        match self {
-            Self::Overview => "Overview",
-            Self::Processes => "Processes",
-            Self::Tmpfs => "Tmpfs",
-            Self::Shared => "Shared",
-        }
-    }
-
-    #[must_use]
-    pub fn drives_process_scans(self) -> bool {
-        matches!(self, Self::Processes)
-    }
-
-    #[must_use]
-    pub fn bindings(self) -> &'static [Binding] {
-        match self {
-            Self::Overview => OVERVIEW_BINDINGS,
-            Self::Processes => PROCESS_ACTIONS,
-            Self::Tmpfs => TMPFS_ACTIONS,
-            Self::Shared => SHARED_ACTIONS,
-        }
-    }
-
-    #[must_use]
-    pub fn navigation(self) -> &'static [Binding] {
-        match self {
-            Self::Overview => &[],
-            Self::Processes | Self::Tmpfs => TREE_NAVIGATION,
-            Self::Shared => FLAT_NAVIGATION,
-        }
-    }
+tab_catalog! {
+    Overview => {
+        title: "Overview",
+        token: "overview",
+        scans: false,
+        navigation: &[],
+        bindings: OVERVIEW_BINDINGS
+    },
+    Processes => {
+        title: "Processes",
+        token: "processes",
+        scans: true,
+        navigation: TREE_NAVIGATION,
+        bindings: PROCESS_ACTIONS
+    },
+    Tmpfs => {
+        title: "Tmpfs",
+        token: "tmpfs",
+        scans: false,
+        navigation: TREE_NAVIGATION,
+        bindings: TMPFS_ACTIONS
+    },
+    Shared => {
+        title: "Shared",
+        token: "shared",
+        scans: false,
+        navigation: FLAT_NAVIGATION,
+        bindings: SHARED_ACTIONS
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

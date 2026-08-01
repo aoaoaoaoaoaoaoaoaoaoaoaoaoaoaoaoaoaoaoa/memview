@@ -67,8 +67,12 @@ impl Bytes {
 
     #[must_use]
     pub fn human_iec(self) -> String {
+        self.to_string()
+    }
+
+    fn write_human_iec(self, formatter: &mut Formatter<'_>) -> fmt::Result {
         if self.0 < 1024 {
-            return format!("{} B", self.0);
+            return write!(formatter, "{} B", self.0);
         }
 
         let mut value = self.as_f64();
@@ -77,12 +81,12 @@ impl Bytes {
             value /= Self::KIB;
             unit += 1;
         }
-        format!("{value:.1} {}", Self::UNITS[unit])
+        write!(formatter, "{value:.1} {}", Self::UNITS[unit])
     }
 
     #[must_use]
     pub fn human_exact(self) -> String {
-        format!("{} ({})", self.human_iec(), self.0)
+        format!("{self} ({})", self.0)
     }
 }
 
@@ -105,7 +109,7 @@ impl AddAssign for Bytes {
 
 impl Display for Bytes {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.human_iec())
+        self.write_human_iec(f)
     }
 }
 
@@ -174,20 +178,15 @@ impl MemoryRollup {
     }
 
     #[must_use]
-    pub fn shared(self) -> Bytes {
-        self.shared_clean + self.shared_dirty + self.shared_hugetlb
-    }
-
-    #[must_use]
     pub fn metric(self, metric: Metric) -> Bytes {
         match metric {
             Metric::Pss => self.pss,
             Metric::Uss => self.uss(),
             Metric::Rss => self.rss,
             Metric::SwapPss => self.swap_pss,
-            Metric::Anonymous => self.pss_anon.max(self.anonymous),
+            Metric::Anonymous => self.pss_anon,
             Metric::File => self.pss_file,
-            Metric::Shmem => self.pss_shmem.max(self.shared()),
+            Metric::Shmem => self.pss_shmem,
         }
     }
 }
@@ -623,50 +622,51 @@ impl TmpfsMount {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Metric {
-    Pss,
-    Uss,
-    Rss,
-    SwapPss,
-    Anonymous,
-    File,
-    Shmem,
+macro_rules! metric_catalog {
+    ($($variant:ident => $label:literal / $token:literal),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        #[repr(u8)]
+        pub enum Metric {$($variant),+}
+
+        impl Metric {
+            pub const ALL: [Self; metric_catalog!(@count $($variant)+)] = [$(Self::$variant),+];
+
+            #[must_use]
+            pub fn next(self) -> Self {
+                Self::ALL[(self as usize + 1) % Self::ALL.len()]
+            }
+
+            #[must_use]
+            pub fn label(self) -> &'static str {
+                match self {$(Self::$variant => $label),+}
+            }
+
+            #[must_use]
+            pub fn token(self) -> &'static str {
+                match self {$(Self::$variant => $token),+}
+            }
+
+            #[must_use]
+            pub fn from_token(token: &str) -> Option<Self> {
+                match token {$($token => Some(Self::$variant),)+ _ => None}
+            }
+        }
+    };
+    (@count $head:ident $($tail:ident)*) => {1usize $(+ metric_catalog!(@one $tail))*};
+    (@one $variant:ident) => {1usize};
+}
+
+metric_catalog! {
+    Pss => "PSS" / "pss",
+    Uss => "USS" / "uss",
+    Rss => "RSS" / "rss",
+    SwapPss => "SwapPSS" / "swap-pss",
+    Anonymous => "Anon PSS" / "anonymous",
+    File => "File PSS" / "file",
+    Shmem => "Shmem PSS" / "shmem",
 }
 
 impl Metric {
-    const ALL: [Self; 7] = [
-        Self::Pss,
-        Self::Uss,
-        Self::Rss,
-        Self::SwapPss,
-        Self::Anonymous,
-        Self::File,
-        Self::Shmem,
-    ];
-
-    #[must_use]
-    pub fn next(self) -> Self {
-        let index = Self::ALL
-            .iter()
-            .position(|metric| *metric == self)
-            .unwrap_or(0);
-        Self::ALL[(index + 1) % Self::ALL.len()]
-    }
-
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Pss => "PSS",
-            Self::Uss => "USS",
-            Self::Rss => "RSS",
-            Self::SwapPss => "SwapPSS",
-            Self::Anonymous => "Anon",
-            Self::File => "File",
-            Self::Shmem => "Shmem",
-        }
-    }
-
     #[must_use]
     pub fn cmp_rollup(self, lhs: MemoryRollup, rhs: MemoryRollup) -> Ordering {
         rhs.metric(self).cmp(&lhs.metric(self))
@@ -841,5 +841,19 @@ mod tests {
         assert_eq!(rollup.pss, Bytes::ZERO);
         assert_eq!(rollup.pss_anon, Bytes::ZERO);
         assert_eq!(rollup.swap_pss, Bytes::ZERO);
+    }
+
+    #[test]
+    fn pss_category_lenses_never_substitute_rss_categories() {
+        let rollup = MemoryRollup {
+            anonymous: Bytes(11),
+            shared_clean: Bytes(13),
+            shared_dirty: Bytes(17),
+            shared_hugetlb: Bytes(19),
+            ..MemoryRollup::default()
+        };
+
+        assert_eq!(rollup.metric(Metric::Anonymous), Bytes::ZERO);
+        assert_eq!(rollup.metric(Metric::Shmem), Bytes::ZERO);
     }
 }

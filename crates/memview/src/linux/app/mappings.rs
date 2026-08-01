@@ -1,7 +1,6 @@
 use super::super::model::{LedgerState, ObjectUsage, Pid, ProcessKey};
 use super::super::probe;
 use color_eyre::eyre::{Result, ensure};
-use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 struct MappingLedger {
@@ -88,16 +87,6 @@ impl MappingLedgers {
                     Ok(())
                 }
             }
-        }
-    }
-
-    pub(super) fn retain(&mut self, live: &BTreeSet<ProcessKey>) {
-        if self
-            .selected
-            .as_ref()
-            .is_some_and(|(key, _)| !live.contains(key))
-        {
-            self.selected = None;
         }
     }
 
@@ -229,5 +218,21 @@ mod tests {
         assert!(ledgers.begin(expected));
         assert!(ledgers.finish(expected, Ok(scan(key(2)))).is_err());
         assert_eq!(ledgers.state(expected, LedgerState::Deferred), "deferred");
+    }
+
+    #[test]
+    fn a_new_process_generation_can_refresh_the_same_selection() {
+        let selected = key(1);
+        let mut ledgers = MappingLedgers::default();
+        assert!(ledgers.begin(selected));
+        ledgers
+            .finish(selected, Ok(scan(selected)))
+            .expect("valid result");
+        assert!(!ledgers.begin(selected));
+
+        ledgers.clear();
+        assert!(ledgers.begin(selected));
+        assert!(ledgers.objects(selected).is_empty());
+        assert_eq!(ledgers.state(selected, LedgerState::Deferred), "loading");
     }
 }
