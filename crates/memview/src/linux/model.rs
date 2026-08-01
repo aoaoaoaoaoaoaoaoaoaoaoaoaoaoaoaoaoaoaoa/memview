@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::fmt::{self, Display, Formatter};
-use std::ops::{Add, AddAssign, Deref, Sub, SubAssign};
+use std::ops::{Add, AddAssign, Deref};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -35,12 +35,20 @@ impl Bytes {
 
     #[must_use]
     pub fn from_kib(kib: u64) -> Self {
-        Self(kib.saturating_mul(1024))
+        Self::from_wide(u128::from(kib) * 1024)
     }
 
     #[must_use]
     pub fn from_blocks_512(blocks: u64) -> Self {
-        Self(blocks.saturating_mul(512))
+        Self::from_wide(u128::from(blocks) * 512)
+    }
+
+    #[must_use]
+    pub fn from_wide(bytes: u128) -> Self {
+        match u64::try_from(bytes) {
+            Ok(bytes) => Self(bytes),
+            Err(_) => std::process::abort(),
+        }
     }
 
     #[must_use]
@@ -82,27 +90,16 @@ impl Add for Bytes {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
-        Self(self.0.saturating_add(rhs.0))
+        match self.0.checked_add(rhs.0) {
+            Some(bytes) => Self(bytes),
+            None => std::process::abort(),
+        }
     }
 }
 
 impl AddAssign for Bytes {
     fn add_assign(&mut self, rhs: Self) {
-        self.0 = self.0.saturating_add(rhs.0);
-    }
-}
-
-impl Sub for Bytes {
-    type Output = Self;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        Self(self.0.saturating_sub(rhs.0))
-    }
-}
-
-impl SubAssign for Bytes {
-    fn sub_assign(&mut self, rhs: Self) {
-        self.0 = self.0.saturating_sub(rhs.0);
+        *self = *self + rhs;
     }
 }
 
@@ -114,7 +111,7 @@ impl Display for Bytes {
 
 macro_rules! memory_rollup {
     ($($field:ident => $proc_key:literal),+ $(,)?) => {
-        #[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
         pub struct MemoryRollup {
             $(pub $field: Bytes,)+
         }
@@ -208,23 +205,27 @@ pub struct Meminfo {
 
 impl Meminfo {
     #[must_use]
-    pub fn get(&self, key: &str) -> Bytes {
+    pub fn value(&self, key: &str) -> Option<Bytes> {
         self.entries
             .iter()
             .find(|entry| entry.key == key)
-            .map_or(Bytes::ZERO, |entry| entry.value)
+            .map(|entry| entry.value)
     }
 
     #[must_use]
-    pub fn physical_ledger(&self) -> PhysicalMemoryLedger {
+    pub fn physical_ledger(&self) -> Option<PhysicalMemoryLedger> {
+        // /proc/meminfo is neither exhaustive nor wholly disjoint. This deliberately uses only
+        // physical-state counters documented by the kernel and exposes the remainder as an
+        // estimate, never as a proof of ownership. Contract:
+        // https://docs.kernel.org/filesystems/proc.html#meminfo
         let sum = |keys: &[&str]| {
             keys.iter()
-                .map(|key| self.get(key))
+                .filter_map(|key| self.value(key))
                 .fold(Bytes::ZERO, |total, value| total + value)
         };
-        let total = self.get("MemTotal");
-        let free = self.get("MemFree");
-        let allocated = total - free;
+        let total = self.value("MemTotal")?;
+        let free = self.value("MemFree")?;
+        let allocated = total.0.checked_sub(free.0).map(Bytes)?;
         let lru = sum(&[
             "Active(anon)",
             "Inactive(anon)",
@@ -232,8 +233,8 @@ impl Meminfo {
             "Inactive(file)",
             "Unevictable",
         ]);
-        let slab = self.get("Slab");
-        let hugetlb = self.get("Hugetlb");
+        let slab = self.value("Slab").unwrap_or(Bytes::ZERO);
+        let hugetlb = self.value("Hugetlb").unwrap_or(Bytes::ZERO);
         let kernel = sum(&[
             "KernelStack",
             "ShadowCallStack",
@@ -249,7 +250,14 @@ impl Meminfo {
         ]);
         let classified = lru + slab + hugetlb + kernel;
 
-        PhysicalMemoryLedger {
+        let residual = allocated.0.checked_sub(classified.0).map_or_else(
+            || PhysicalResidual::Inconsistent {
+                excess: Bytes(classified.0 - allocated.0),
+            },
+            |bytes| PhysicalResidual::Estimate(Bytes(bytes)),
+        );
+
+        Some(PhysicalMemoryLedger {
             total,
             free,
             allocated,
@@ -257,12 +265,12 @@ impl Meminfo {
             slab,
             hugetlb,
             kernel,
-            direct: allocated - classified,
-        }
+            residual,
+        })
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PhysicalMemoryLedger {
     pub total: Bytes,
     pub free: Bytes,
@@ -271,7 +279,13 @@ pub struct PhysicalMemoryLedger {
     pub slab: Bytes,
     pub hugetlb: Bytes,
     pub kernel: Bytes,
-    pub direct: Bytes,
+    pub residual: PhysicalResidual,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalResidual {
+    Estimate(Bytes),
+    Inconsistent { excess: Bytes },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -288,6 +302,37 @@ pub enum ObjectKind {
     Vvar,
     Vsyscall,
     Pseudo,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum BackingIdentity {
+    DeviceInode {
+        device_major: u32,
+        device_minor: u32,
+        inode: u64,
+    },
+    ProcessRegion {
+        process: ProcessKey,
+        start_address: u64,
+    },
+    SysvTable(i32),
+}
+
+impl Display for BackingIdentity {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeviceInode {
+                device_major,
+                device_minor,
+                inode,
+            } => write!(f, "{device_major:x}:{device_minor:x}:{inode}"),
+            Self::ProcessRegion {
+                process,
+                start_address,
+            } => write!(f, "{process}:{start_address:x}"),
+            Self::SysvTable(id) => write!(f, "sysvipc:{id}"),
+        }
+    }
 }
 
 impl ObjectKind {
@@ -312,6 +357,7 @@ impl ObjectKind {
 
 #[derive(Clone, Debug)]
 pub struct ObjectUsage {
+    pub backing: BackingIdentity,
     pub kind: ObjectKind,
     pub label: String,
     pub rollup: MemoryRollup,
@@ -328,6 +374,7 @@ pub struct ObjectConsumer {
 
 #[derive(Clone, Debug)]
 pub struct SharedObject {
+    pub backing: BackingIdentity,
     pub kind: ObjectKind,
     pub label: String,
     pub rollup: MemoryRollup,
@@ -354,18 +401,57 @@ impl LedgerState {
             Self::Deferred => "deferred",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StatusMemory {
+    pub rss: Bytes,
+    pub anonymous: Bytes,
+    pub file: Bytes,
+    pub shmem: Bytes,
+    pub swap: Bytes,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessMemory {
+    Smaps(MemoryRollup),
+    Status(StatusMemory),
+}
+
+impl ProcessMemory {
+    #[must_use]
+    pub fn rollup(self) -> MemoryRollup {
+        match self {
+            Self::Smaps(rollup) => rollup,
+            Self::Status(status) => MemoryRollup {
+                rss: status.rss,
+                anonymous: status.anonymous,
+                swap: status.swap,
+                ..MemoryRollup::default()
+            },
+        }
+    }
 
     #[must_use]
-    pub fn is_degraded(self) -> bool {
-        matches!(self, Self::Approximate | Self::Inaccessible)
+    pub fn state(self) -> LedgerState {
+        match self {
+            Self::Smaps(_) => LedgerState::Exact,
+            Self::Status(_) => LedgerState::Approximate,
+        }
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ProcessTreeStats {
-    pub observed_processes: usize,
-    pub degraded_rollups: usize,
-    pub degraded_maps: usize,
+pub struct ProcessCoverage {
+    pub candidates: usize,
+    pub captured: usize,
+    pub vanished: usize,
+    pub inaccessible: usize,
+    pub exact_rollups: usize,
+    pub status_rollups: usize,
+    pub exact_maps: usize,
+    pub inaccessible_maps: usize,
+    pub deferred_maps: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -379,9 +465,8 @@ pub struct ProcessRecord {
     pub username: String,
     pub state: String,
     pub threads: u32,
-    pub rollup: MemoryRollup,
+    pub memory: ProcessMemory,
     pub objects: Vec<ObjectUsage>,
-    pub rollup_state: LedgerState,
     pub mappings_state: LedgerState,
 }
 
@@ -392,6 +477,16 @@ impl ProcessRecord {
             pid: self.pid,
             start_time_ticks: self.start_time_ticks,
         }
+    }
+
+    #[must_use]
+    pub fn rollup(&self) -> MemoryRollup {
+        self.memory.rollup()
+    }
+
+    #[must_use]
+    pub fn rollup_state(&self) -> LedgerState {
+        self.memory.state()
     }
 }
 
@@ -446,7 +541,7 @@ impl Display for ProcessCwd {
 pub struct ProcessTree {
     pub roots: Vec<usize>,
     pub nodes: Vec<ProcessNode>,
-    pub stats: ProcessTreeStats,
+    pub coverage: ProcessCoverage,
 }
 
 #[derive(Clone, Debug)]
@@ -559,9 +654,6 @@ impl Metric {
 
 #[derive(Clone, Debug, Default)]
 pub struct ProcessTotals {
-    pub process_count: usize,
-    pub degraded_rollups: usize,
-    pub degraded_maps: usize,
     pub pss: Bytes,
     pub uss: Bytes,
     pub rss: Bytes,
@@ -571,8 +663,19 @@ pub struct ProcessTotals {
     pub pss_shmem: Bytes,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CaptureId(pub u64);
+
+impl Display for CaptureId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        Display::fmt(&self.0, f)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct CaptureStamp {
+    pub id: CaptureId,
+    pub began_at: SystemTime,
     pub captured_at: SystemTime,
     pub elapsed: Duration,
 }
@@ -592,9 +695,11 @@ pub struct NvidiaPoolSnapshot {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NvidiaPoolLedger {
+    Unsupported,
     Disabled,
     Exact(NvidiaPoolSnapshot),
     Inaccessible,
+    Malformed,
 }
 
 #[derive(Clone, Debug)]
@@ -602,7 +707,7 @@ pub struct Inventory {
     pub meminfo: Meminfo,
     pub sysv_segments: Vec<SysvSegment>,
     pub sysv_rss_total: Bytes,
-    pub nvidia_pools: Option<NvidiaPoolLedger>,
+    pub nvidia_pools: NvidiaPoolLedger,
 }
 
 #[derive(Clone, Debug)]
@@ -621,6 +726,7 @@ pub struct Tmpfs {
 #[derive(Clone, Debug)]
 pub struct Shared {
     pub meminfo: Meminfo,
+    pub coverage: ProcessCoverage,
     pub objects: Vec<SharedObject>,
 }
 
@@ -650,11 +756,59 @@ mod tests {
             value: Bytes(value),
         })
         .collect();
-        let ledger = Meminfo { entries }.physical_ledger();
+        let ledger = Meminfo { entries }
+            .physical_ledger()
+            .expect("required counters exist");
 
         assert_eq!(ledger.allocated, Bytes(900));
         assert_eq!(ledger.lru, Bytes(500));
         assert_eq!(ledger.kernel, Bytes(50));
-        assert_eq!(ledger.direct, Bytes(150));
+        assert_eq!(ledger.residual, PhysicalResidual::Estimate(Bytes(150)));
+    }
+
+    #[test]
+    fn physical_ledger_fails_closed_without_required_counters() {
+        let meminfo = Meminfo {
+            entries: vec![MeminfoEntry {
+                key: "MemTotal".to_string(),
+                value: Bytes(1_000),
+            }],
+        };
+        assert!(meminfo.physical_ledger().is_none());
+    }
+
+    #[test]
+    fn physical_ledger_exposes_counter_inconsistency() {
+        let entries = [("MemTotal", 1_000), ("MemFree", 500), ("Slab", 600)]
+            .into_iter()
+            .map(|(key, value)| MeminfoEntry {
+                key: key.to_string(),
+                value: Bytes(value),
+            })
+            .collect();
+        let ledger = Meminfo { entries }
+            .physical_ledger()
+            .expect("required counters exist");
+        assert_eq!(
+            ledger.residual,
+            PhysicalResidual::Inconsistent { excess: Bytes(100) }
+        );
+    }
+
+    #[test]
+    fn status_memory_never_masquerades_as_pss() {
+        let memory = ProcessMemory::Status(StatusMemory {
+            rss: Bytes(100),
+            anonymous: Bytes(70),
+            file: Bytes(20),
+            shmem: Bytes(10),
+            swap: Bytes(5),
+        });
+        let rollup = memory.rollup();
+        assert_eq!(memory.state(), LedgerState::Approximate);
+        assert_eq!(rollup.rss, Bytes(100));
+        assert_eq!(rollup.pss, Bytes::ZERO);
+        assert_eq!(rollup.pss_anon, Bytes::ZERO);
+        assert_eq!(rollup.swap_pss, Bytes::ZERO);
     }
 }

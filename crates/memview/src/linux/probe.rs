@@ -1,9 +1,9 @@
 use super::model::{
-    Bytes, CaptureStamp, Inventory, Ledger, LedgerState, Meminfo, MeminfoEntry, MemoryRollup,
-    Metric, NvidiaPoolLedger, NvidiaPoolSnapshot, ObjectConsumer, ObjectKind, ObjectUsage, Pid,
-    ProcessCwd, ProcessKey, ProcessNode, ProcessRecord, ProcessTotals, ProcessTree,
-    ProcessTreeStats, Processes, Shared, SharedObject, SysvSegment, TmpfsMount, TmpfsNode,
-    TmpfsNodeKind,
+    BackingIdentity, Bytes, CaptureId, CaptureStamp, Inventory, Ledger, LedgerState, Meminfo,
+    MeminfoEntry, MemoryRollup, Metric, NvidiaPoolLedger, NvidiaPoolSnapshot, ObjectConsumer,
+    ObjectKind, ObjectUsage, Pid, ProcessCoverage, ProcessCwd, ProcessKey, ProcessMemory,
+    ProcessNode, ProcessRecord, ProcessTotals, ProcessTree, Processes, Shared, SharedObject,
+    StatusMemory, SysvSegment, TmpfsMount, TmpfsNode, TmpfsNodeKind,
 };
 use color_eyre::eyre::{Context, Result, eyre};
 use rustix::param::page_size;
@@ -15,6 +15,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant, SystemTime};
 use uzers::get_user_by_uid;
 use walkdir::WalkDir;
@@ -23,6 +24,16 @@ const DELETED_MAPPING_SUFFIX: &str = " (deleted)";
 const NVIDIA_PARAMS: &str = "/proc/driver/nvidia/params";
 const SHRINKER_ROOT: &str = "/sys/kernel/debug/shrinker";
 const NVIDIA_POOL_PREFIX: &str = "nv-sysmem-alloc-node-";
+static NEXT_CAPTURE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn capture_stamp(began_at: SystemTime, started: Instant) -> CaptureStamp {
+    CaptureStamp {
+        id: CaptureId(NEXT_CAPTURE_ID.fetch_add(1, AtomicOrdering::Relaxed)),
+        began_at,
+        captured_at: SystemTime::now(),
+        elapsed: started.elapsed(),
+    }
+}
 
 #[derive(Debug)]
 pub struct ProcessMappingScan {
@@ -42,6 +53,7 @@ pub struct ProcessMappingCost {
 }
 
 pub fn capture_inventory() -> Result<Ledger<Inventory>> {
+    let began_at = SystemTime::now();
     let started = Instant::now();
     let mut warnings = Vec::new();
     let meminfo = read_meminfo().wrap_err("failed to read /proc/meminfo")?;
@@ -52,21 +64,8 @@ pub fn capture_inventory() -> Result<Ledger<Inventory>> {
         .map(|segment| segment.rss)
         .fold(Bytes::ZERO, |total, rss| total + rss);
     let nvidia_pools = read_nvidia_pool_ledger(&mut warnings);
-    if let Some(NvidiaPoolLedger::Exact(snapshot)) = nvidia_pools
-        && snapshot.bytes > meminfo.physical_ledger().direct
-    {
-        warnings.push(
-            "NVIDIA pool count exceeds the direct/unclassified residual; the independently read \
-             kernel snapshots raced"
-                .to_string(),
-        );
-    }
-
     Ok(Ledger {
-        stamp: CaptureStamp {
-            captured_at: SystemTime::now(),
-            elapsed: started.elapsed(),
-        },
+        stamp: capture_stamp(began_at, started),
         value: Inventory {
             meminfo,
             sysv_segments,
@@ -77,42 +76,58 @@ pub fn capture_inventory() -> Result<Ledger<Inventory>> {
     })
 }
 
-fn read_nvidia_pool_ledger(warnings: &mut Vec<String>) -> Option<NvidiaPoolLedger> {
+fn read_nvidia_pool_ledger(warnings: &mut Vec<String>) -> NvidiaPoolLedger {
     let params = match fs::read_to_string(NVIDIA_PARAMS) {
         Ok(params) => params,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return NvidiaPoolLedger::Unsupported;
+        }
         Err(error) => {
             warnings.push(format!("NVIDIA driver parameters unavailable: {error}"));
-            return Some(NvidiaPoolLedger::Inaccessible);
+            return NvidiaPoolLedger::Inaccessible;
         }
     };
-    let mask = nvidia_pool_mask(&params)?;
+    let mask = match nvidia_pool_mask(&params) {
+        Ok(mask) => mask,
+        Err(error) => {
+            warnings.push(format!("NVIDIA pool configuration is malformed: {error}"));
+            return NvidiaPoolLedger::Malformed;
+        }
+    };
     if mask == 0 {
-        return Some(NvidiaPoolLedger::Disabled);
+        return NvidiaPoolLedger::Disabled;
     }
 
     match read_nvidia_pool_snapshot(Path::new(SHRINKER_ROOT), page_size()) {
-        Ok(snapshot) => Some(NvidiaPoolLedger::Exact(snapshot)),
+        Ok(snapshot) => NvidiaPoolLedger::Exact(snapshot),
         Err(error) => {
             warnings.push(format!(
                 "NVIDIA system page pools are enabled but their shrinker counts are unavailable: \
-                 {error}. The direct/unclassified residual still includes them"
+                 {error}. The /proc/meminfo residual estimate may include them"
             ));
-            Some(NvidiaPoolLedger::Inaccessible)
+            NvidiaPoolLedger::Inaccessible
         }
     }
 }
 
-fn nvidia_pool_mask(params: &str) -> Option<u64> {
-    params.lines().find_map(|line| {
-        let (key, value) = line.split_once(':')?;
-        (key.trim() == "EnableSystemMemoryPools")
-            .then(|| value.trim().parse().ok())
-            .flatten()
-    })
+fn nvidia_pool_mask(params: &str) -> Result<u64> {
+    let value = params
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            (key.trim() == "EnableSystemMemoryPools").then_some(value.trim())
+        })
+        .ok_or_else(|| eyre!("EnableSystemMemoryPools is absent"))?;
+    value
+        .parse()
+        .wrap_err("EnableSystemMemoryPools is not an integer")
 }
 
 fn read_nvidia_pool_snapshot(root: &Path, page_size: usize) -> Result<NvidiaPoolSnapshot> {
+    // NVIDIA's open driver registers NUMA-aware shrinkers under this name and reports
+    // `pages_owned`; each object is one PAGE_SIZE << order allocation. Source contract pinned at
+    // 452cec62d827034798072827d3866d1881662b77:
+    // https://github.com/NVIDIA/open-gpu-kernel-modules/blob/main/kernel-open/nvidia/nv-vm.c
     let mut bytes = 0u64;
     let mut pool_count = 0usize;
 
@@ -128,6 +143,12 @@ fn read_nvidia_pool_snapshot(root: &Path, page_size: usize) -> Result<NvidiaPool
             .checked_add(pool_bytes)
             .ok_or_else(|| eyre!("NVIDIA pool total overflows"))?;
         pool_count += 1;
+    }
+
+    if pool_count == 0 {
+        return Err(eyre!(
+            "no {NVIDIA_POOL_PREFIX}* shrinkers matched the enabled pool configuration"
+        ));
     }
 
     Ok(NvidiaPoolSnapshot {
@@ -169,17 +190,15 @@ fn nvidia_pool_bytes(objects: u64, page_size: usize, order: u32) -> Result<u64> 
 }
 
 pub fn capture_processes() -> Result<Ledger<Processes>> {
+    let began_at = SystemTime::now();
     let started = Instant::now();
     let mut warnings = Vec::new();
     let meminfo = read_meminfo().wrap_err("failed to read /proc/meminfo")?;
     let forest = scan_processes(&mut warnings).wrap_err("failed to scan /proc")?;
-    let tree = build_process_tree(forest.processes, forest.stats);
+    let tree = build_process_tree(forest.processes, forest.coverage);
     let totals = derive_process_totals(&tree);
     Ok(Ledger {
-        stamp: CaptureStamp {
-            captured_at: SystemTime::now(),
-            elapsed: started.elapsed(),
-        },
+        stamp: capture_stamp(began_at, started),
         value: Processes {
             meminfo,
             tree,
@@ -204,7 +223,7 @@ pub fn capture_process_mappings(key: ProcessKey) -> Result<ProcessMappingScan> {
             Ok(text) => {
                 let read_elapsed = read_started.elapsed();
                 let parse_started = Instant::now();
-                let objects = parse_smaps(&text, &mount_index);
+                let objects = parse_smaps(&text, &mount_index, key);
                 (
                     objects,
                     LedgerState::Exact,
@@ -246,24 +265,23 @@ pub fn verify_process_identity(expected: ProcessKey) -> Result<()> {
 }
 
 pub fn capture_shared_objects() -> Result<Ledger<Shared>> {
+    let began_at = SystemTime::now();
     let started = Instant::now();
     let mut warnings = Vec::new();
     let meminfo = read_meminfo().wrap_err("failed to read /proc/meminfo")?;
     let mount_index = MountIndex::read().wrap_err("failed to read /proc/self/mountinfo")?;
     let sysv_segments =
         read_sysv_segments(&mut warnings).wrap_err("failed to read /proc/sysvipc/shm")?;
-    let mut processes = scan_process_shells(&mut warnings).wrap_err("failed to scan /proc")?;
-    attach_all_mapping_ledgers(&mut processes, &mount_index);
-    let stats = process_stats(&processes);
-    let process_tree = build_process_tree(processes, stats);
+    let mut forest = scan_process_shells(&mut warnings).wrap_err("failed to scan /proc")?;
+    attach_all_mapping_ledgers(&mut forest.processes, &mount_index, &mut warnings);
+    finish_process_coverage(&forest.processes, &mut forest.coverage);
+    let process_tree = build_process_tree(forest.processes, forest.coverage);
 
     Ok(Ledger {
-        stamp: CaptureStamp {
-            captured_at: SystemTime::now(),
-            elapsed: started.elapsed(),
-        },
+        stamp: capture_stamp(began_at, started),
         value: Shared {
             meminfo,
+            coverage: process_tree.coverage,
             objects: fold_shared_objects(&process_tree, &sysv_segments),
         },
         warnings,
@@ -279,6 +297,7 @@ pub fn tmpfs_mount_points() -> Result<Vec<PathBuf>> {
 }
 
 pub fn capture_tmpfs_mount(path: &Path) -> Result<Ledger<TmpfsMount>> {
+    let began_at = SystemTime::now();
     let started = Instant::now();
     let mount_index = MountIndex::read().wrap_err("failed to read /proc/self/mountinfo")?;
     let info = mount_index
@@ -288,10 +307,7 @@ pub fn capture_tmpfs_mount(path: &Path) -> Result<Ledger<TmpfsMount>> {
     let mount = scan_tmpfs_mount(&info)?;
 
     Ok(Ledger {
-        stamp: CaptureStamp {
-            captured_at: SystemTime::now(),
-            elapsed: started.elapsed(),
-        },
+        stamp: capture_stamp(began_at, started),
         value: mount,
         warnings: Vec::new(),
     })
@@ -435,7 +451,7 @@ fn parse_meminfo(text: &str) -> Meminfo {
 
 fn meminfo_value(key: &str, number: u64, unit: Option<&str>, hugepage_size: Bytes) -> Bytes {
     if key.starts_with("HugePages_") {
-        return Bytes(number.saturating_mul(hugepage_size.0));
+        return Bytes::from_wide(u128::from(number) * u128::from(hugepage_size.0));
     }
 
     match unit {
@@ -499,9 +515,10 @@ fn parse_column<T: std::str::FromStr>(
     fields.get(position)?.parse().ok()
 }
 
-fn scan_process_shells(warnings: &mut Vec<String>) -> Result<Vec<ProcessRecord>> {
+fn scan_process_shells(warnings: &mut Vec<String>) -> Result<ProcessForest> {
     let mut processes = Vec::new();
     let mut usernames = BTreeMap::new();
+    let mut coverage = ProcessCoverage::default();
 
     for entry in fs::read_dir("/proc")? {
         let entry = match entry {
@@ -515,22 +532,30 @@ fn scan_process_shells(warnings: &mut Vec<String>) -> Result<Vec<ProcessRecord>>
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
             continue;
         };
+        coverage.candidates += 1;
 
         match scan_process_shell(Pid(pid), &mut usernames) {
             Ok(Some(process)) => processes.push(process),
-            Ok(None) => {}
-            Err(error) => warnings.push(format!("ignoring pid {pid}: {error}")),
+            Ok(None) => coverage.vanished += 1,
+            Err(error) => {
+                coverage.inaccessible += 1;
+                warnings.push(format!("pid {pid} was not captured: {error}"));
+            }
         }
     }
 
-    Ok(processes)
+    coverage.captured = processes.len();
+    Ok(ProcessForest {
+        processes,
+        coverage,
+    })
 }
 
 fn scan_processes(warnings: &mut Vec<String>) -> Result<ProcessForest> {
-    let mut processes = scan_process_shells(warnings)?;
-    let stats = process_stats(&processes);
-    processes.sort_by_key(|process| process.pid);
-    Ok(ProcessForest { processes, stats })
+    let mut forest = scan_process_shells(warnings)?;
+    forest.processes.sort_by_key(|process| process.pid);
+    finish_process_coverage(&forest.processes, &mut forest.coverage);
+    Ok(forest)
 }
 
 fn scan_process_shell(
@@ -540,26 +565,12 @@ fn scan_process_shell(
     let root = PathBuf::from("/proc").join(pid.0.to_string());
     let key = match read_process_key(&root, pid) {
         Ok(key) => key,
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
-            ) =>
-        {
-            return Ok(None);
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
     let status_text = match fs::read_to_string(root.join("status")) {
         Ok(text) => text,
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
-            ) =>
-        {
-            return Ok(None);
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
 
@@ -567,19 +578,16 @@ fn scan_process_shell(
     let command = read_cmdline(&root).unwrap_or_else(|| status.name.clone());
     let cwd = read_cwd(&root);
     let username = lookup_username(status.uid, usernames);
-    let fallback_rollup = MemoryRollup {
+    let status_memory = StatusMemory {
         rss: status.vm_rss,
-        pss: status.vm_rss,
         anonymous: status.rss_anon,
-        pss_anon: status.rss_anon,
-        pss_file: status.rss_file,
-        pss_shmem: status.rss_shmem,
+        file: status.rss_file,
+        shmem: status.rss_shmem,
         swap: status.vm_swap,
-        ..MemoryRollup::default()
     };
-    let (rollup, rollup_state) = match fs::read_to_string(root.join("smaps_rollup")) {
-        Ok(text) => (parse_rollup_kv(&text), LedgerState::Exact),
-        Err(_) => (fallback_rollup, LedgerState::Approximate),
+    let memory = match fs::read_to_string(root.join("smaps_rollup")) {
+        Ok(text) => ProcessMemory::Smaps(parse_rollup_kv(&text)),
+        Err(_) => ProcessMemory::Status(status_memory),
     };
 
     if read_process_key(&root, pid)? != key {
@@ -596,9 +604,8 @@ fn scan_process_shell(
         username,
         state: status.state,
         threads: status.threads,
-        rollup,
+        memory,
         objects: Vec::new(),
-        rollup_state,
         mappings_state: LedgerState::Deferred,
     }))
 }
@@ -606,26 +613,41 @@ fn scan_process_shell(
 #[derive(Clone, Debug)]
 struct ProcessForest {
     processes: Vec<ProcessRecord>,
-    stats: ProcessTreeStats,
+    coverage: ProcessCoverage,
 }
 
-fn process_stats(processes: &[ProcessRecord]) -> ProcessTreeStats {
-    ProcessTreeStats {
-        observed_processes: processes.len(),
-        degraded_rollups: processes
-            .iter()
-            .filter(|process| process.rollup_state.is_degraded())
-            .count(),
-        degraded_maps: processes
-            .iter()
-            .filter(|process| process.mappings_state.is_degraded())
-            .count(),
-    }
+fn finish_process_coverage(processes: &[ProcessRecord], coverage: &mut ProcessCoverage) {
+    coverage.captured = processes.len();
+    coverage.exact_rollups = processes
+        .iter()
+        .filter(|process| process.rollup_state() == LedgerState::Exact)
+        .count();
+    coverage.status_rollups = processes
+        .iter()
+        .filter(|process| process.rollup_state() == LedgerState::Approximate)
+        .count();
+    coverage.exact_maps = processes
+        .iter()
+        .filter(|process| process.mappings_state == LedgerState::Exact)
+        .count();
+    coverage.inaccessible_maps = processes
+        .iter()
+        .filter(|process| process.mappings_state == LedgerState::Inaccessible)
+        .count();
+    coverage.deferred_maps = processes
+        .iter()
+        .filter(|process| process.mappings_state == LedgerState::Deferred)
+        .count();
 }
 
-fn attach_all_mapping_ledgers(processes: &mut [ProcessRecord], mount_index: &MountIndex) {
+fn attach_all_mapping_ledgers(
+    processes: &mut [ProcessRecord],
+    mount_index: &MountIndex,
+    warnings: &mut Vec<String>,
+) {
     for process in processes.iter_mut() {
-        if process.rollup.rss == Bytes::ZERO && process.rollup.pss == Bytes::ZERO {
+        let rollup = process.rollup();
+        if rollup.rss == Bytes::ZERO && rollup.pss == Bytes::ZERO {
             continue;
         }
         let key = process.key();
@@ -633,13 +655,20 @@ fn attach_all_mapping_ledgers(processes: &mut [ProcessRecord], mount_index: &Mou
         match fs::read_to_string(root.join("smaps")) {
             Ok(text) => {
                 if verify_process_key(&root, key).is_ok() {
-                    process.objects = parse_smaps(&text, mount_index);
+                    process.objects = parse_smaps(&text, mount_index, key);
                     process.mappings_state = LedgerState::Exact;
                 } else {
                     process.mappings_state = LedgerState::Inaccessible;
+                    warnings.push(format!(
+                        "pid {} changed identity during smaps capture",
+                        key.pid
+                    ));
                 }
             }
-            Err(_) => process.mappings_state = LedgerState::Inaccessible,
+            Err(error) => {
+                process.mappings_state = LedgerState::Inaccessible;
+                warnings.push(format!("pid {} smaps unavailable: {error}", key.pid));
+            }
         }
     }
 }
@@ -804,8 +833,8 @@ fn parse_kib_value(line: &str) -> Option<(&str, Bytes)> {
     Some((key.trim(), Bytes::from_kib(value)))
 }
 
-fn parse_smaps(text: &str, mount_index: &MountIndex) -> Vec<ObjectUsage> {
-    let mut objects = BTreeMap::<(ObjectKind, String), ObjectUsage>::new();
+fn parse_smaps(text: &str, mount_index: &MountIndex, process: ProcessKey) -> Vec<ObjectUsage> {
+    let mut objects = BTreeMap::<BackingIdentity, ObjectUsage>::new();
     let mut current = None::<MappingAccumulator>;
 
     for line in text.lines() {
@@ -814,6 +843,7 @@ fn parse_smaps(text: &str, mount_index: &MountIndex) -> Vec<ObjectUsage> {
             current = Some(MappingAccumulator::new(
                 classify_mapping(&header.path, mount_index),
                 header.size,
+                header.backing(process),
             ));
             continue;
         }
@@ -837,14 +867,15 @@ fn parse_smaps(text: &str, mount_index: &MountIndex) -> Vec<ObjectUsage> {
 
 fn flush_mapping(
     current: &mut Option<MappingAccumulator>,
-    objects: &mut BTreeMap<(ObjectKind, String), ObjectUsage>,
+    objects: &mut BTreeMap<BackingIdentity, ObjectUsage>,
 ) {
     let Some(mapping) = current.take() else {
         return;
     };
 
-    let key = (mapping.kind, mapping.label.clone());
+    let key = mapping.backing.clone();
     let entry = objects.entry(key).or_insert_with(|| ObjectUsage {
+        backing: mapping.backing.clone(),
         kind: mapping.kind,
         label: mapping.label.clone(),
         rollup: MemoryRollup::default(),
@@ -856,14 +887,16 @@ fn flush_mapping(
 
 #[derive(Clone, Debug)]
 struct MappingAccumulator {
+    backing: BackingIdentity,
     kind: ObjectKind,
     label: String,
     rollup: MemoryRollup,
 }
 
 impl MappingAccumulator {
-    fn new(classified: ClassifiedMapping, size: Bytes) -> Self {
+    fn new(classified: ClassifiedMapping, size: Bytes, backing: BackingIdentity) -> Self {
         Self {
+            backing,
             kind: classified.kind,
             label: classified.label,
             rollup: MemoryRollup {
@@ -876,8 +909,29 @@ impl MappingAccumulator {
 
 #[derive(Clone, Debug)]
 struct MappingHeader {
+    start_address: u64,
     size: Bytes,
+    device_major: u32,
+    device_minor: u32,
+    inode: u64,
     path: String,
+}
+
+impl MappingHeader {
+    fn backing(&self, process: ProcessKey) -> BackingIdentity {
+        if self.inode == 0 {
+            BackingIdentity::ProcessRegion {
+                process,
+                start_address: self.start_address,
+            }
+        } else {
+            BackingIdentity::DeviceInode {
+                device_major: self.device_major,
+                device_minor: self.device_minor,
+                inode: self.inode,
+            }
+        }
+    }
 }
 
 fn parse_mapping_header(line: &str) -> Option<MappingHeader> {
@@ -885,16 +939,23 @@ fn parse_mapping_header(line: &str) -> Option<MappingHeader> {
     let range = take_field(line, &mut cursor)?;
     let _perms = take_field(line, &mut cursor)?;
     let _offset = take_field(line, &mut cursor)?;
-    let _dev = take_field(line, &mut cursor)?;
-    let _inode = take_field(line, &mut cursor)?;
+    let dev = take_field(line, &mut cursor)?;
+    let inode = take_field(line, &mut cursor)?.parse().ok()?;
     let path = line[cursor..].trim().to_string();
 
     let (start, end) = range.split_once('-')?;
     let start = u64::from_str_radix(start, 16).ok()?;
     let end = u64::from_str_radix(end, 16).ok()?;
+    let (device_major, device_minor) = dev.split_once(':')?;
+    let device_major = u32::from_str_radix(device_major, 16).ok()?;
+    let device_minor = u32::from_str_radix(device_minor, 16).ok()?;
 
     Some(MappingHeader {
+        start_address: start,
         size: Bytes(end.saturating_sub(start)),
+        device_major,
+        device_minor,
+        inode,
         path,
     })
 }
@@ -1008,11 +1069,11 @@ fn restore_deleted_suffix(raw: String, deleted: bool) -> String {
     }
 }
 
-fn build_process_tree(processes: Vec<ProcessRecord>, stats: ProcessTreeStats) -> ProcessTree {
+fn build_process_tree(processes: Vec<ProcessRecord>, coverage: ProcessCoverage) -> ProcessTree {
     let mut nodes = processes
         .into_iter()
         .map(|process| {
-            let subtree = process.rollup;
+            let subtree = process.rollup();
             ProcessNode {
                 process,
                 subtree,
@@ -1046,13 +1107,13 @@ fn build_process_tree(processes: Vec<ProcessRecord>, stats: ProcessTreeStats) ->
     ProcessTree {
         roots,
         nodes,
-        stats,
+        coverage,
     }
 }
 
 fn accumulate_subtree(index: usize, nodes: &mut [ProcessNode]) -> MemoryRollup {
     let children = nodes[index].children.clone();
-    let mut subtotal = nodes[index].rollup;
+    let mut subtotal = nodes[index].rollup();
     for child in children {
         subtotal += accumulate_subtree(child, nodes);
     }
@@ -1065,6 +1126,7 @@ fn fold_shared_objects(
     sysv_segments: &[SysvSegment],
 ) -> Vec<SharedObject> {
     struct Accumulator {
+        backing: BackingIdentity,
         kind: ObjectKind,
         label: String,
         rollup: MemoryRollup,
@@ -1072,13 +1134,14 @@ fn fold_shared_objects(
         consumers: Vec<ObjectConsumer>,
     }
 
-    let mut objects = BTreeMap::<(ObjectKind, String), Accumulator>::new();
+    let mut objects = BTreeMap::<BackingIdentity, Accumulator>::new();
 
     for node in &process_tree.nodes {
         for object in &node.objects {
             let entry = objects
-                .entry((object.kind, object.label.clone()))
+                .entry(object.backing.clone())
                 .or_insert_with(|| Accumulator {
+                    backing: object.backing.clone(),
                     kind: object.kind,
                     label: object.label.clone(),
                     rollup: MemoryRollup::default(),
@@ -1105,6 +1168,7 @@ fn fold_shared_objects(
                     .then_with(|| lhs.pid.cmp(&rhs.pid))
             });
             SharedObject {
+                backing: acc.backing,
                 kind: acc.kind,
                 label: acc.label,
                 rollup: acc.rollup,
@@ -1117,6 +1181,7 @@ fn fold_shared_objects(
 
     for segment in sysv_segments {
         rows.push(SharedObject {
+            backing: BackingIdentity::SysvTable(segment.id),
             kind: ObjectKind::SysV,
             label: format!(
                 "sysv:{} owner:{} attaches:{} size:{}",
@@ -1146,21 +1211,17 @@ fn fold_shared_objects(
 }
 
 fn derive_process_totals(process_tree: &ProcessTree) -> ProcessTotals {
-    let mut totals = ProcessTotals {
-        process_count: process_tree.stats.observed_processes,
-        degraded_rollups: process_tree.stats.degraded_rollups,
-        degraded_maps: process_tree.stats.degraded_maps,
-        ..ProcessTotals::default()
-    };
+    let mut totals = ProcessTotals::default();
 
     for node in &process_tree.nodes {
-        totals.pss += node.rollup.pss;
-        totals.uss += node.rollup.uss();
-        totals.rss += node.rollup.rss;
-        totals.swap_pss += node.rollup.swap_pss;
-        totals.pss_anon += node.rollup.pss_anon;
-        totals.pss_file += node.rollup.pss_file;
-        totals.pss_shmem += node.rollup.pss_shmem;
+        let rollup = node.rollup();
+        totals.pss += rollup.pss;
+        totals.uss += rollup.uss();
+        totals.rss += rollup.rss;
+        totals.swap_pss += rollup.swap_pss;
+        totals.pss_anon += rollup.pss_anon;
+        totals.pss_file += rollup.pss_file;
+        totals.pss_shmem += rollup.pss_shmem;
     }
 
     totals
@@ -1382,7 +1443,9 @@ fn parse_size_option(value: &str) -> Option<Bytes> {
         "p" | "pb" => 1024_u64.pow(5),
         _ => return None,
     };
-    Some(Bytes(number.saturating_mul(multiplier)))
+    Some(Bytes::from_wide(
+        u128::from(number) * u128::from(multiplier),
+    ))
 }
 
 #[cfg(test)]
@@ -1392,7 +1455,8 @@ mod tests {
     #[test]
     fn parses_nvidia_pool_parameter_and_shrinker_identity() {
         let params = "Foo: 1\nEnableSystemMemoryPools: 529\nBar: 2\n";
-        assert_eq!(nvidia_pool_mask(params), Some(529));
+        assert_eq!(nvidia_pool_mask(params).ok(), Some(529));
+        assert!(nvidia_pool_mask("Foo: 1\n").is_err());
         assert_eq!(
             parse_nvidia_pool_name(OsStr::new("nv-sysmem-alloc-node-3-order-9-417")),
             Some((3, 9))
@@ -1406,6 +1470,16 @@ mod tests {
         assert_eq!(parse_shrinker_node_count(count, 1).ok(), Some(13));
         assert_eq!(nvidia_pool_bytes(13, 4096, 9).ok(), Some(13 << 21));
         assert!(parse_shrinker_node_count(count, 3).is_err());
+    }
+
+    #[test]
+    fn enabled_nvidia_pool_probe_rejects_an_empty_shrinker_directory() {
+        let root =
+            std::env::temp_dir().join(format!("memview-empty-shrinkers-{}", std::process::id()));
+        fs::create_dir(&root).expect("create isolated shrinker fixture");
+        let result = read_nvidia_pool_snapshot(&root, 4096);
+        fs::remove_dir(&root).expect("remove isolated shrinker fixture");
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1426,28 +1500,31 @@ mod tests {
             username: "test".to_string(),
             state: "S".to_string(),
             threads: 1,
-            rollup: MemoryRollup {
+            memory: ProcessMemory::Smaps(MemoryRollup {
                 pss: Bytes(pss),
                 rss: Bytes(pss),
                 ..MemoryRollup::default()
-            },
+            }),
             objects: Vec::new(),
-            rollup_state: LedgerState::Exact,
             mappings_state: LedgerState::Deferred,
         }
     }
 
     #[test]
-    fn process_stats_preserve_every_summary_process() {
+    fn process_coverage_preserves_every_summary_process() {
         let processes = vec![
             scanned_process(1, 9_900),
             scanned_process(2, 50),
             scanned_process(3, 50),
         ];
-        let stats = process_stats(&processes);
-        assert_eq!(stats.observed_processes, 3);
-        assert_eq!(stats.degraded_rollups, 0);
-        assert_eq!(stats.degraded_maps, 0);
+        let mut coverage = ProcessCoverage {
+            candidates: 3,
+            ..ProcessCoverage::default()
+        };
+        finish_process_coverage(&processes, &mut coverage);
+        assert_eq!(coverage.captured, 3);
+        assert_eq!(coverage.exact_rollups, 3);
+        assert_eq!(coverage.deferred_maps, 3);
     }
 
     #[test]
@@ -1464,7 +1541,52 @@ mod tests {
         let line = "7f1230000000-7f1230001000 rw-s 00000000 00:01 42 /memfd:cache shard (deleted)";
         let parsed = parse_mapping_header(line).expect("header");
         assert_eq!(parsed.size, Bytes(0x1000));
+        assert_eq!(parsed.device_major, 0);
+        assert_eq!(parsed.device_minor, 1);
+        assert_eq!(parsed.inode, 42);
         assert!(parsed.path.contains("/memfd:cache shard"));
+    }
+
+    #[test]
+    fn shared_backing_identity_ignores_aliasing_path_labels() {
+        let key = ProcessKey {
+            pid: Pid(7),
+            start_time_ticks: 11,
+        };
+        let smaps = concat!(
+            "1000-2000 rw-s 00000000 00:01 42 /first-name\n",
+            "Pss: 1 kB\n",
+            "2000-3000 rw-s 00001000 00:01 42 /second-name\n",
+            "Pss: 2 kB\n",
+            "3000-4000 rw-s 00000000 00:01 43 /first-name\n",
+            "Pss: 3 kB\n",
+        );
+        let objects = parse_smaps(smaps, &MountIndex::default(), key);
+        assert_eq!(objects.len(), 2);
+        assert!(objects.iter().any(|object| {
+            object.regions == 2
+                && object.rollup.pss == Bytes::from_kib(3)
+                && matches!(
+                    object.backing,
+                    BackingIdentity::DeviceInode { inode: 42, .. }
+                )
+        }));
+    }
+
+    #[test]
+    fn inode_zero_backings_remain_process_local() {
+        let smaps = "1000-2000 rw-p 00000000 00:00 0\nPss: 1 kB\n";
+        let first = ProcessKey {
+            pid: Pid(7),
+            start_time_ticks: 11,
+        };
+        let second = ProcessKey {
+            pid: Pid(8),
+            start_time_ticks: 12,
+        };
+        let first = parse_smaps(smaps, &MountIndex::default(), first);
+        let second = parse_smaps(smaps, &MountIndex::default(), second);
+        assert_ne!(first[0].backing, second[0].backing);
     }
 
     #[test]
@@ -1479,8 +1601,11 @@ mod tests {
         let parsed = parse_meminfo(
             "MemTotal: 1024 kB\nHugePages_Total: 3\nHugePages_Free: 2\nHugepagesize: 2048 kB\n",
         );
-        assert_eq!(parsed.get("MemTotal"), Bytes(1024 * 1024));
-        assert_eq!(parsed.get("HugePages_Total"), Bytes(3 * 2048 * 1024));
-        assert_eq!(parsed.get("HugePages_Free"), Bytes(2 * 2048 * 1024));
+        assert_eq!(parsed.value("MemTotal"), Some(Bytes(1024 * 1024)));
+        assert_eq!(
+            parsed.value("HugePages_Total"),
+            Some(Bytes(3 * 2048 * 1024))
+        );
+        assert_eq!(parsed.value("HugePages_Free"), Some(Bytes(2 * 2048 * 1024)));
     }
 }

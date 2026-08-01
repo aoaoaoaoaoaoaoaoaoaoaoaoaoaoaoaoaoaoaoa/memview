@@ -71,7 +71,7 @@ pub(super) fn build_shared_rows(
             }
             FlatSharedRow {
                 index,
-                key: (object.kind, object.label.clone()),
+                key: object.backing.clone(),
                 search: search.map_or(SearchRole::Ordinary, |_| SearchRole::Match),
             }
         })
@@ -303,7 +303,7 @@ impl Forest for ProcessForest<'_> {
     }
 
     fn direct_value(&self, handle: Self::Handle) -> Bytes {
-        self.node(handle).rollup.metric(self.metric)
+        self.node(handle).rollup().metric(self.metric)
     }
 
     fn total_value(&self, handle: Self::Handle) -> Bytes {
@@ -340,7 +340,10 @@ impl Forest for ProcessForest<'_> {
     }
 
     fn system_total(&self) -> Bytes {
-        self.processes.meminfo.get("MemTotal")
+        self.processes
+            .meminfo
+            .value("MemTotal")
+            .unwrap_or(Bytes::ZERO)
     }
 
     fn summary_label(&self) -> &'static str {

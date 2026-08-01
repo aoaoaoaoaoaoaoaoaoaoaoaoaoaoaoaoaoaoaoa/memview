@@ -1,6 +1,6 @@
 use super::super::model::{
-    CaptureStamp, LedgerState, MemoryRollup, ProcessCwd, ProcessRecord, ProcessTree,
-    ProcessTreeStats,
+    BackingIdentity, CaptureId, CaptureStamp, LedgerState, MemoryRollup, ObjectKind,
+    ProcessCoverage, ProcessCwd, ProcessMemory, ProcessRecord, ProcessTree,
 };
 use super::*;
 use std::path::Path;
@@ -52,6 +52,8 @@ fn tmpfs_dir(path: &str, allocated: Bytes, children: Vec<TmpfsNode>) -> TmpfsNod
 fn ledger<T>(value: T) -> Ledger<T> {
     Ledger {
         stamp: CaptureStamp {
+            id: CaptureId(1),
+            began_at: SystemTime::UNIX_EPOCH,
             captured_at: SystemTime::UNIX_EPOCH,
             elapsed: Duration::ZERO,
         },
@@ -77,7 +79,7 @@ fn process_ledger(nodes: Vec<ProcessNode>) -> Ledger<Processes> {
         tree: ProcessTree {
             roots: (0..nodes.len()).collect(),
             nodes,
-            stats: ProcessTreeStats::default(),
+            coverage: ProcessCoverage::default(),
         },
         totals: super::super::model::ProcessTotals::default(),
     })
@@ -100,9 +102,8 @@ fn process_node(pid: i32, command: &str, cwd: Option<&str>) -> ProcessNode {
             username: "test".to_string(),
             state: "S".to_string(),
             threads: 1,
-            rollup,
+            memory: ProcessMemory::Smaps(rollup),
             objects: Vec::new(),
-            rollup_state: LedgerState::Exact,
             mappings_state: LedgerState::Deferred,
         },
         subtree: rollup,
@@ -119,6 +120,7 @@ fn regex(pattern: &str) -> Search {
 #[test]
 fn shared_rows_obey_the_selected_metric() {
     let object = |label: &str, pss: u64, rss: u64| SharedObject {
+        backing: BackingIdentity::SysvTable(pss as i32),
         kind: ObjectKind::File,
         label: label.to_string(),
         rollup: MemoryRollup {
@@ -132,6 +134,7 @@ fn shared_rows_obey_the_selected_metric() {
     };
     let shared = Shared {
         meminfo: Meminfo::default(),
+        coverage: ProcessCoverage::default(),
         objects: vec![object("pss", 20, 10), object("rss", 10, 20)],
     };
 

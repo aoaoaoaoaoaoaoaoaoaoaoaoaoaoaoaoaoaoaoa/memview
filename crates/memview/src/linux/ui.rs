@@ -1,7 +1,7 @@
 use super::app::{App, Binding, FlatProcessRow, FlatSharedRow, FlatTmpfsRow, RowFold};
 use super::model::{
-    Bytes, Meminfo, MeminfoEntry, NvidiaPoolLedger, ObjectUsage, Pid, ProcessTotals, Processes,
-    Shared, TmpfsMount,
+    Bytes, Meminfo, MeminfoEntry, NvidiaPoolLedger, ObjectUsage, PhysicalResidual, Pid,
+    ProcessCoverage, ProcessMemory, ProcessTotals, Processes, Shared, TmpfsMount,
 };
 use super::nav::FooterHint;
 use super::search::SearchRole;
@@ -224,50 +224,61 @@ fn render_overview(frame: &mut Frame<'_>, app: &App, area: Rect) {
         columns[0],
     );
 
-    let physical = meminfo.physical_ledger();
-    let mut physical_rows = vec![
-        accounting_row("Allocated RAM", physical.allocated, physical.total),
-        accounting_row("LRU pages", physical.lru, physical.total),
-        accounting_row("Slab", physical.slab, physical.total),
-        accounting_row("HugeTLB", physical.hugetlb, physical.total),
-        accounting_row("Kernel counters", physical.kernel, physical.total),
-    ];
-    match app.inventory().and_then(|inventory| inventory.nvidia_pools) {
-        Some(NvidiaPoolLedger::Exact(snapshot)) => {
-            physical_rows.push(accounting_row(
-                &format!("NVIDIA pools ({})", snapshot.pool_count),
-                snapshot.bytes,
-                physical.total,
-            ));
-            physical_rows.push(accounting_row(
-                "Other direct / unknown",
-                physical.direct - snapshot.bytes,
-                physical.total,
-            ));
-        }
-        Some(NvidiaPoolLedger::Disabled) => {
-            physical_rows.push(accounting_row(
-                "Direct / unclassified",
-                physical.direct,
-                physical.total,
-            ));
-            physical_rows.push(summary_text_row("NVIDIA sysmem pools", "disabled"));
-        }
-        Some(NvidiaPoolLedger::Inaccessible) => {
-            physical_rows.push(accounting_row(
-                "Direct / unclassified",
-                physical.direct,
-                physical.total,
-            ));
-            physical_rows.push(summary_text_row("NVIDIA sysmem pools", "inaccessible"));
-        }
-        None => physical_rows.push(accounting_row(
-            "Direct / unclassified",
-            physical.direct,
-            physical.total,
-        )),
-    }
-    physical_rows.push(accounting_row("Free RAM", physical.free, physical.total));
+    let physical_rows = meminfo.physical_ledger().map_or_else(
+        || {
+            vec![summary_text_row(
+                "Physical ledger",
+                "required counters absent",
+            )]
+        },
+        |physical| {
+            let mut rows = vec![
+                accounting_row("Allocated RAM", physical.allocated, physical.total),
+                accounting_row("LRU pages", physical.lru, physical.total),
+                accounting_row("Slab", physical.slab, physical.total),
+                accounting_row("HugeTLB", physical.hugetlb, physical.total),
+                accounting_row("Kernel counters", physical.kernel, physical.total),
+            ];
+            let nvidia = app
+                .inventory()
+                .map_or(NvidiaPoolLedger::Unsupported, |inventory| {
+                    inventory.nvidia_pools
+                });
+            match physical.residual {
+                PhysicalResidual::Inconsistent { excess } => rows.push(summary_text_row(
+                    "Counter overlap",
+                    &format!("classified exceeds allocated by {excess}"),
+                )),
+                PhysicalResidual::Estimate(direct) => match nvidia {
+                    NvidiaPoolLedger::Exact(snapshot) => {
+                        rows.push(accounting_row(
+                            &format!("NVIDIA pool lens ({})", snapshot.pool_count),
+                            snapshot.bytes,
+                            physical.total,
+                        ));
+                        rows.push(accounting_row("Residual estimate", direct, physical.total));
+                    }
+                    NvidiaPoolLedger::Disabled => {
+                        rows.push(accounting_row("Residual estimate", direct, physical.total));
+                        rows.push(summary_text_row("NVIDIA sysmem pools", "disabled"));
+                    }
+                    NvidiaPoolLedger::Inaccessible => {
+                        rows.push(accounting_row("Residual estimate", direct, physical.total));
+                        rows.push(summary_text_row("NVIDIA sysmem pools", "inaccessible"));
+                    }
+                    NvidiaPoolLedger::Malformed => {
+                        rows.push(accounting_row("Residual estimate", direct, physical.total));
+                        rows.push(summary_text_row("NVIDIA sysmem pools", "malformed"));
+                    }
+                    NvidiaPoolLedger::Unsupported => {
+                        rows.push(accounting_row("Residual estimate", direct, physical.total));
+                    }
+                },
+            }
+            rows.push(accounting_row("Free RAM", physical.free, physical.total));
+            rows
+        },
+    );
     frame.render_widget(
         Table::new(
             physical_rows,
@@ -282,6 +293,11 @@ fn render_overview(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let process_totals = app
         .processes()
         .map_or_else(ProcessTotals::default, |processes| processes.totals.clone());
+    let process_coverage = app
+        .processes()
+        .map_or_else(ProcessCoverage::default, |processes| {
+            processes.tree.coverage
+        });
     let tmpfs_allocated = app
         .tmpfs()
         .map_or(Bytes::ZERO, |tmpfs| tmpfs.allocated_total);
@@ -292,14 +308,38 @@ fn render_overview(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .inventory()
         .map_or(0, |inventory| inventory.sysv_segments.len());
     let overview_rows = vec![
-        summary_row("Σ process PSS", process_totals.pss),
-        summary_row("Σ process USS", process_totals.uss),
-        summary_row("Σ process RSS", process_totals.rss),
-        summary_row("Σ process SwapPSS", process_totals.swap_pss),
-        summary_row("Σ process PSS anon", process_totals.pss_anon),
-        summary_row("Σ process PSS file", process_totals.pss_file),
-        summary_row("Σ process PSS shmem", process_totals.pss_shmem),
-        summary_row("Σ tmpfs allocated", tmpfs_allocated),
+        summary_row(
+            &format!("Σ process PSS [{}]", app.process_capture_label()),
+            process_totals.pss,
+        ),
+        summary_row(
+            &format!("Σ process USS [{}]", app.process_capture_label()),
+            process_totals.uss,
+        ),
+        summary_row(
+            &format!("Σ process RSS [{}]", app.process_capture_label()),
+            process_totals.rss,
+        ),
+        summary_row(
+            &format!("Σ process SwapPSS [{}]", app.process_capture_label()),
+            process_totals.swap_pss,
+        ),
+        summary_row(
+            &format!("Σ process PSS anon [{}]", app.process_capture_label()),
+            process_totals.pss_anon,
+        ),
+        summary_row(
+            &format!("Σ process PSS file [{}]", app.process_capture_label()),
+            process_totals.pss_file,
+        ),
+        summary_row(
+            &format!("Σ process PSS shmem [{}]", app.process_capture_label()),
+            process_totals.pss_shmem,
+        ),
+        summary_row(
+            &format!("Σ tmpfs allocated [{}]", app.tmpfs_capture_label()),
+            tmpfs_allocated,
+        ),
         summary_row("Σ SysV shm RSS", sysv_rss),
     ];
     frame.render_widget(
@@ -308,7 +348,7 @@ fn render_overview(frame: &mut Frame<'_>, app: &App, area: Rect) {
             [Constraint::Length(24), Constraint::Length(16)],
         )
         .header(header_row(["Lens", "Value"]))
-        .block(panel("attribution lenses"))
+        .block(panel("independent attribution captures"))
         .column_spacing(1),
         right[1],
     );
@@ -317,13 +357,20 @@ fn render_overview(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let warning_lines = if warnings.is_empty() {
         vec![Line::from(Span::styled(
             format!(
-                "No probe warnings. {} processes, {sysv_segments} SysV segments; scan {} ms. \
-                 Degraded rollups/maps: {}/{}. Direct/unclassified is the physical residual after \
-                 disjoint kernel counters.",
-                process_totals.process_count,
+                "No probe warnings. Captured {}/{} processes ({} vanished, {} inaccessible), \
+                 {sysv_segments} SysV segments; scan {} ms. Rollups exact/status: {}/{}; maps \
+                 exact/inaccessible/deferred: {}/{}/{}. The physical residual is an estimate from \
+                 selected /proc/meminfo counters, which can overlap or omit ownership.",
+                process_coverage.captured,
+                process_coverage.candidates,
+                process_coverage.vanished,
+                process_coverage.inaccessible,
                 app.last_capture_elapsed().as_millis(),
-                process_totals.degraded_rollups,
-                process_totals.degraded_maps,
+                process_coverage.exact_rollups,
+                process_coverage.status_rollups,
+                process_coverage.exact_maps,
+                process_coverage.inaccessible_maps,
+                process_coverage.deferred_maps,
             ),
             Style::default().fg(FG),
         ))]
@@ -353,7 +400,7 @@ fn render_processes(frame: &mut Frame<'_>, app: &App, area: Rect) {
         render_loading(frame, app, area);
         return;
     };
-    let capacity = processes.meminfo.get("MemTotal");
+    let capacity = processes.meminfo.value("MemTotal").unwrap_or(Bytes::ZERO);
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(57), Constraint::Percentage(43)])
@@ -429,18 +476,32 @@ fn render_processes(frame: &mut Frame<'_>, app: &App, area: Rect) {
         details.extend([
             detail_line("State", &process.state),
             detail_line("Threads", &process.threads.to_string()),
-            detail_line("PSS", &process.rollup.pss.human_exact()),
-            detail_line("USS", &process.rollup.uss().human_exact()),
-            detail_line("RSS", &process.rollup.rss.human_exact()),
-            detail_line("PSS anon", &process.rollup.pss_anon.human_exact()),
-            detail_line("PSS file", &process.rollup.pss_file.human_exact()),
-            detail_line("PSS shmem", &process.rollup.pss_shmem.human_exact()),
-            detail_line("SwapPSS", &process.rollup.swap_pss.human_exact()),
+        ]);
+        match process.memory {
+            ProcessMemory::Smaps(rollup) => details.extend([
+                detail_line("PSS", &rollup.pss.human_exact()),
+                detail_line("USS", &rollup.uss().human_exact()),
+                detail_line("RSS", &rollup.rss.human_exact()),
+                detail_line("PSS anon", &rollup.pss_anon.human_exact()),
+                detail_line("PSS file", &rollup.pss_file.human_exact()),
+                detail_line("PSS shmem", &rollup.pss_shmem.human_exact()),
+                detail_line("SwapPSS", &rollup.swap_pss.human_exact()),
+            ]),
+            ProcessMemory::Status(status) => details.extend([
+                detail_line("PSS / USS", "unavailable"),
+                detail_line("Status RSS", &status.rss.human_exact()),
+                detail_line("RSS anon", &status.anonymous.human_exact()),
+                detail_line("RSS file", &status.file.human_exact()),
+                detail_line("RSS shmem", &status.shmem.human_exact()),
+                detail_line("Status swap", &status.swap.human_exact()),
+            ]),
+        }
+        details.extend([
             detail_line(
                 "Access",
                 &format!(
                     "rollup={} maps={}",
-                    process.rollup_state.label(),
+                    process.rollup_state().label(),
                     app.selected_process_mapping_status()
                 ),
             ),
@@ -516,7 +577,8 @@ fn mapping_loading(pid: Pid, elapsed: Duration) -> Paragraph<'static> {
 fn render_tmpfs(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let capacity = app
         .meminfo()
-        .map_or(Bytes::ZERO, |meminfo| meminfo.get("MemTotal"));
+        .and_then(|meminfo| meminfo.value("MemTotal"))
+        .unwrap_or(Bytes::ZERO);
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
@@ -573,7 +635,7 @@ fn render_shared(frame: &mut Frame<'_>, app: &App, area: Rect) {
         render_loading(frame, app, area);
         return;
     };
-    let capacity = shared.meminfo.get("MemTotal");
+    let capacity = shared.meminfo.value("MemTotal").unwrap_or(Bytes::ZERO);
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
@@ -609,14 +671,17 @@ fn render_shared(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .header(header_row([
             "Kind", "Tasks", "PSS", "RSS", "VMAs", "Object",
         ]))
-        .block(panel("global object ledger"))
+        .block(panel(&format!(
+            "backing ledger ({}/{} maps exact)",
+            shared.coverage.exact_maps, shared.coverage.captured
+        )))
         .column_spacing(1),
         columns[0],
     );
 
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(8), Constraint::Min(8)])
+        .constraints([Constraint::Length(9), Constraint::Min(8)])
         .split(columns[1]);
     if let Some(object) = app.selected_shared_object() {
         let mut summary = search_summary_lines(app, capacity);
@@ -626,6 +691,7 @@ fn render_shared(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             )),
             detail_line("Kind", object.kind.label()),
+            detail_line("Backing", &object.backing.to_string()),
             detail_line("PSS", &object.rollup.pss.human_exact()),
             detail_line("RSS", &object.rollup.rss.human_exact()),
             detail_line("Swap", &object.rollup.swap.human_exact()),
@@ -685,7 +751,7 @@ fn render_shared(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn row_meminfo(entry: &MeminfoEntry, meminfo: &Meminfo) -> Row<'static> {
-    let total = meminfo.get("MemTotal");
+    let total = meminfo.value("MemTotal").unwrap_or(Bytes::ZERO);
     let color = MeminfoTone::for_key(&entry.key).color(entry.value, meminfo);
     Row::new(vec![
         Cell::from(entry.key.clone()),
@@ -932,8 +998,8 @@ impl MeminfoTone {
     fn color(self, value: Bytes, meminfo: &Meminfo) -> Color {
         match self {
             Self::Neutral => neutral_meminfo_color(value),
-            Self::Reserve => reserve_color(value, meminfo.get("MemTotal")),
-            Self::Pressure => usage_color(value, meminfo.get("MemTotal")),
+            Self::Reserve => reserve_color(value, meminfo.value("MemTotal").unwrap_or(Bytes::ZERO)),
+            Self::Pressure => usage_color(value, meminfo.value("MemTotal").unwrap_or(Bytes::ZERO)),
         }
     }
 }
@@ -1001,11 +1067,12 @@ fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Line::from(""),
         section_heading("Notes"),
         Line::from(
-            "Overview reconciles physical RAM; direct/unclassified catches pages absent from \
-             disjoint kernel counters.",
+            "Overview estimates a physical-RAM counter partition; /proc/meminfo counters can \
+             overlap and omit subsystem ownership.",
         ),
         Line::from(
-            "NVIDIA system pools are split from that residual when shrinker debugfs is readable.",
+            "NVIDIA system pools appear as an independent lens when shrinker debugfs is readable; \
+             they are not subtracted because the kernel snapshots can overlap or race.",
         ),
         Line::from("Processes uses PSS so shared pages are not double-counted."),
         Line::from(

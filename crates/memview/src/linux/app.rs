@@ -1,5 +1,5 @@
 use super::model::{
-    Bytes, Inventory, Ledger, Meminfo, Metric, ObjectKind, ObjectUsage, Pid, ProcessKey,
+    BackingIdentity, Bytes, Inventory, Ledger, Meminfo, Metric, ObjectUsage, Pid, ProcessKey,
     ProcessNode, Processes, Shared, SharedObject, Tmpfs, TmpfsMount, TmpfsNode, TmpfsNodeKind,
 };
 use super::nav::{self, Action};
@@ -71,7 +71,7 @@ impl TreeScope {
     #[must_use]
     pub fn rollup(self, node: &ProcessNode) -> super::model::MemoryRollup {
         match self {
-            Self::SelfOnly => node.rollup,
+            Self::SelfOnly => node.rollup(),
             Self::SelfAndChildren => node.subtree,
         }
     }
@@ -102,7 +102,7 @@ pub struct FlatTmpfsRow {
 #[derive(Clone, Debug)]
 pub struct FlatSharedRow {
     pub index: usize,
-    key: (ObjectKind, String),
+    key: BackingIdentity,
     pub search: SearchRole,
 }
 
@@ -158,7 +158,7 @@ impl IdentifiedRow for FlatTmpfsRow {
 }
 
 impl IdentifiedRow for FlatSharedRow {
-    type Key = (ObjectKind, String);
+    type Key = BackingIdentity;
 
     fn key(&self) -> &Self::Key {
         &self.key
@@ -330,7 +330,7 @@ impl DeMinimis {
 }
 
 fn pct(value: Bytes, percent: u64) -> Bytes {
-    Bytes(((u128::from(value.0) * u128::from(percent)) / 100).min(u128::from(u64::MAX)) as u64)
+    Bytes::from_wide((u128::from(value.0) * u128::from(percent)) / 100)
 }
 
 #[derive(Debug)]
@@ -693,7 +693,6 @@ impl App {
             warnings,
         } = ledger;
 
-        self.ledgers.last_stamp = Some(stamp);
         let tmpfs = self.ledgers.tmpfs.get_or_insert_with(|| Ledger {
             stamp,
             value: Tmpfs {
@@ -753,19 +752,37 @@ impl App {
 
     #[must_use]
     pub fn current_time_label(&self) -> String {
-        let Some(stamp) = self.ledgers.last_stamp else {
+        let Some(stamp) = self.active_stamp() else {
             return "loading".to_string();
         };
-        match stamp.captured_at.duration_since(SystemTime::UNIX_EPOCH) {
-            Ok(since_epoch) => format!("captured {}", since_epoch.as_secs()),
-            Err(_) => "captured".to_string(),
+        match (
+            stamp.began_at.duration_since(SystemTime::UNIX_EPOCH),
+            stamp.captured_at.duration_since(SystemTime::UNIX_EPOCH),
+        ) {
+            (Ok(began), Ok(captured)) => format!(
+                "capture #{} {}..{} ({} ms)",
+                stamp.id,
+                began.as_secs(),
+                captured.as_secs(),
+                stamp.elapsed.as_millis()
+            ),
+            _ => format!("capture #{} ({} ms)", stamp.id, stamp.elapsed.as_millis()),
+        }
+    }
+
+    fn active_stamp(&self) -> Option<super::model::CaptureStamp> {
+        match self.tab {
+            Tab::Overview => self.ledgers.inventory.as_ref().map(|ledger| ledger.stamp),
+            Tab::Processes => self.ledgers.processes.as_ref().map(|ledger| ledger.stamp),
+            Tab::Tmpfs => self.ledgers.tmpfs.as_ref().map(|ledger| ledger.stamp),
+            Tab::Shared => self.ledgers.shared.as_ref().map(|ledger| ledger.stamp),
         }
     }
 
     #[must_use]
     pub fn active_ledger_ready(&self) -> bool {
         match self.tab {
-            Tab::Overview => self.ledgers.meminfo().is_some(),
+            Tab::Overview => self.ledgers.inventory.is_some(),
             Tab::Processes => self.ledgers.processes.is_some(),
             Tab::Tmpfs => self.ledgers.tmpfs.is_some(),
             Tab::Shared => self.ledgers.shared.is_some(),
@@ -774,7 +791,23 @@ impl App {
 
     #[must_use]
     pub fn meminfo(&self) -> Option<&Meminfo> {
-        self.ledgers.meminfo()
+        match self.tab {
+            Tab::Overview | Tab::Tmpfs => self
+                .ledgers
+                .inventory
+                .as_ref()
+                .map(|ledger| &ledger.value.meminfo),
+            Tab::Processes => self
+                .ledgers
+                .processes
+                .as_ref()
+                .map(|ledger| &ledger.value.meminfo),
+            Tab::Shared => self
+                .ledgers
+                .shared
+                .as_ref()
+                .map(|ledger| &ledger.value.meminfo),
+        }
     }
 
     #[must_use]
@@ -799,27 +832,54 @@ impl App {
 
     #[must_use]
     pub fn last_capture_elapsed(&self) -> Duration {
-        self.ledgers
-            .last_stamp
+        self.active_stamp()
             .map_or(Duration::ZERO, |stamp| stamp.elapsed)
+    }
+
+    #[must_use]
+    pub fn process_capture_label(&self) -> String {
+        self.ledgers.processes.as_ref().map_or_else(
+            || "pending".to_string(),
+            |ledger| format!("#{}", ledger.stamp.id),
+        )
+    }
+
+    #[must_use]
+    pub fn tmpfs_capture_label(&self) -> String {
+        self.ledgers.tmpfs.as_ref().map_or_else(
+            || "pending".to_string(),
+            |ledger| format!("#{}", ledger.stamp.id),
+        )
     }
 
     #[must_use]
     pub fn warnings(&self) -> Vec<&str> {
         let mut warnings = Vec::new();
-        if let Some(ledger) = &self.ledgers.inventory {
-            warnings.extend(ledger.warnings.iter().map(String::as_str));
+        match self.tab {
+            Tab::Overview => {
+                if let Some(ledger) = &self.ledgers.inventory {
+                    warnings.extend(ledger.warnings.iter().map(String::as_str));
+                }
+            }
+            Tab::Processes => {
+                if let Some(ledger) = &self.ledgers.processes {
+                    warnings.extend(ledger.warnings.iter().map(String::as_str));
+                }
+            }
+            Tab::Tmpfs => {
+                if let Some(ledger) = &self.ledgers.tmpfs {
+                    warnings.extend(ledger.warnings.iter().map(String::as_str));
+                }
+            }
+            Tab::Shared => {
+                if let Some(ledger) = &self.ledgers.shared {
+                    warnings.extend(ledger.warnings.iter().map(String::as_str));
+                }
+            }
         }
-        if let Some(ledger) = &self.ledgers.processes {
-            warnings.extend(ledger.warnings.iter().map(String::as_str));
+        if self.tab == Tab::Processes {
+            warnings.extend(self.process_mappings.warnings());
         }
-        if let Some(ledger) = &self.ledgers.tmpfs {
-            warnings.extend(ledger.warnings.iter().map(String::as_str));
-        }
-        if let Some(ledger) = &self.ledgers.shared {
-            warnings.extend(ledger.warnings.iter().map(String::as_str));
-        }
-        warnings.extend(self.process_mappings.warnings());
         warnings
     }
 
@@ -852,9 +912,9 @@ impl App {
 
     fn rebuild_tmpfs_rows(&mut self) {
         let capacity = self
-            .ledgers
             .meminfo()
-            .map_or(Bytes::ZERO, |meminfo| meminfo.get("MemTotal"));
+            .and_then(|meminfo| meminfo.value("MemTotal"))
+            .unwrap_or(Bytes::ZERO);
         let (rows, summary) = self.ledgers.tmpfs_data().map_or_else(
             || (Vec::new(), SearchSummary::new("allocated")),
             |tmpfs| {
