@@ -575,6 +575,10 @@ fn mapping_loading(pid: Pid, elapsed: Duration) -> Paragraph<'static> {
 }
 
 fn render_tmpfs(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(tmpfs) = app.tmpfs() else {
+        render_loading(frame, app, area);
+        return;
+    };
     let capacity = app
         .meminfo()
         .and_then(|meminfo| meminfo.value("MemTotal"))
@@ -609,7 +613,12 @@ fn render_tmpfs(frame: &mut Frame<'_>, app: &App, area: Rect) {
             "Logical",
             "Path",
         ]))
-        .block(panel("tmpfs tree"))
+        .block(panel(&format!(
+            "tmpfs generation ({}/{} filesystems; {} walk gaps)",
+            tmpfs.coverage.captured_filesystems,
+            tmpfs.coverage.unique_filesystems,
+            tmpfs.coverage.walk_errors
+        )))
         .column_spacing(1),
         columns[0],
     );

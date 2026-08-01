@@ -600,7 +600,7 @@ impl App {
     pub fn apply_worker_event(&mut self, event: WorkerEvent, commands: &WorkerPort) {
         match event {
             WorkerEvent::InventoryReady(result) => self.apply_inventory_result(result),
-            WorkerEvent::TmpfsMountReady(result) => self.apply_tmpfs_mount_result(result),
+            WorkerEvent::TmpfsReady(result) => self.apply_tmpfs_result(result),
             WorkerEvent::ProcessesStarted(started) => self.process_scan_started_at = Some(started),
             WorkerEvent::ProcessesReady(result) => self.apply_process_result(result, commands),
             WorkerEvent::ProcessMappingsReady(key, result) => {
@@ -623,11 +623,12 @@ impl App {
         }
     }
 
-    fn apply_tmpfs_mount_result(&mut self, result: Result<Box<Ledger<TmpfsMount>>>) {
+    fn apply_tmpfs_result(&mut self, result: Result<Box<Ledger<Tmpfs>>>) {
         match result {
             Ok(ledger) => {
                 self.last_error = None;
-                self.install_tmpfs_mount(*ledger);
+                self.ledgers.tmpfs = Some(*ledger);
+                self.rebuild_tmpfs_rows();
             }
             Err(error) => self.last_error = Some(format!("{error:#}")),
         }
@@ -684,46 +685,6 @@ impl App {
     fn install_shared(&mut self, ledger: Ledger<Shared>) {
         self.ledgers.install_shared(ledger);
         self.rebuild_shared_rows();
-    }
-
-    fn install_tmpfs_mount(&mut self, ledger: Ledger<TmpfsMount>) {
-        let Ledger {
-            stamp,
-            value,
-            warnings,
-        } = ledger;
-
-        let tmpfs = self.ledgers.tmpfs.get_or_insert_with(|| Ledger {
-            stamp,
-            value: Tmpfs {
-                mounts: Vec::new(),
-                allocated_total: Bytes::ZERO,
-            },
-            warnings: Vec::new(),
-        });
-        tmpfs.stamp = stamp;
-        tmpfs.warnings = warnings;
-        if let Some(slot) = tmpfs
-            .value
-            .mounts
-            .iter_mut()
-            .find(|mount| mount.mount_point == value.mount_point)
-        {
-            *slot = value;
-        } else {
-            tmpfs.value.mounts.push(value);
-        }
-        tmpfs
-            .value
-            .mounts
-            .sort_by_key(|mount| std::cmp::Reverse(mount.root.allocated));
-        tmpfs.value.allocated_total = tmpfs
-            .value
-            .mounts
-            .iter()
-            .map(|mount| mount.root.allocated)
-            .fold(Bytes::ZERO, |total, allocated| total + allocated);
-        self.rebuild_tmpfs_rows();
     }
 
     #[must_use]
@@ -1220,13 +1181,7 @@ impl App {
         match self.tab {
             Tab::Overview => commands.refresh_inventory(),
             Tab::Processes => commands.refresh_processes(),
-            Tab::Tmpfs => {
-                if let Some(mount) = self.selected_tmpfs_mount() {
-                    commands.refresh_tmpfs_mount(mount.mount_point.clone());
-                } else {
-                    commands.refresh_tmpfs();
-                }
-            }
+            Tab::Tmpfs => commands.refresh_tmpfs(),
             Tab::Shared => commands.refresh_shared(),
         }
     }

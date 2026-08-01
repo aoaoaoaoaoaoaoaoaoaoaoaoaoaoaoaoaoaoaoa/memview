@@ -252,11 +252,7 @@ fn largest_subtree<F: Forest>(forest: &F, handle: F::Handle) -> Bytes {
         .map(|child| largest_subtree(forest, child))
         .max()
         .unwrap_or(Bytes::ZERO);
-    if children.is_empty() {
-        child_max
-    } else {
-        child_max.max(forest.total_value(handle))
-    }
+    child_max.max(forest.total_value(handle))
 }
 
 struct ProcessForest<'a> {

@@ -466,7 +466,6 @@ pub struct ProcessRecord {
     pub state: String,
     pub threads: u32,
     pub memory: ProcessMemory,
-    pub objects: Vec<ObjectUsage>,
     pub mappings_state: LedgerState,
 }
 
@@ -721,6 +720,16 @@ pub struct Processes {
 pub struct Tmpfs {
     pub mounts: Vec<TmpfsMount>,
     pub allocated_total: Bytes,
+    pub coverage: TmpfsCoverage,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TmpfsCoverage {
+    pub discovered_mounts: usize,
+    pub unique_filesystems: usize,
+    pub captured_filesystems: usize,
+    pub inaccessible_filesystems: usize,
+    pub walk_errors: usize,
 }
 
 #[derive(Clone, Debug)]

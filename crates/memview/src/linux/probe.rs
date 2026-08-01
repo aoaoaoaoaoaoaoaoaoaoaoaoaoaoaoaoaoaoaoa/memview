@@ -3,7 +3,7 @@ use super::model::{
     MeminfoEntry, MemoryRollup, Metric, NvidiaPoolLedger, NvidiaPoolSnapshot, ObjectConsumer,
     ObjectKind, ObjectUsage, Pid, ProcessCoverage, ProcessCwd, ProcessKey, ProcessMemory,
     ProcessNode, ProcessRecord, ProcessTotals, ProcessTree, Processes, Shared, SharedObject,
-    StatusMemory, SysvSegment, TmpfsMount, TmpfsNode, TmpfsNodeKind,
+    StatusMemory, SysvSegment, Tmpfs, TmpfsCoverage, TmpfsMount, TmpfsNode, TmpfsNodeKind,
 };
 use color_eyre::eyre::{Context, Result, eyre};
 use rustix::param::page_size;
@@ -272,50 +272,74 @@ pub fn capture_shared_objects() -> Result<Ledger<Shared>> {
     let mount_index = MountIndex::read().wrap_err("failed to read /proc/self/mountinfo")?;
     let sysv_segments =
         read_sysv_segments(&mut warnings).wrap_err("failed to read /proc/sysvipc/shm")?;
-    let mut forest = scan_process_shells(&mut warnings).wrap_err("failed to scan /proc")?;
-    attach_all_mapping_ledgers(&mut forest.processes, &mount_index, &mut warnings);
-    finish_process_coverage(&forest.processes, &mut forest.coverage);
-    let process_tree = build_process_tree(forest.processes, forest.coverage);
+    let (objects, coverage) = scan_shared_objects(&mount_index, &sysv_segments, &mut warnings)
+        .wrap_err("failed to scan shared mappings")?;
 
     Ok(Ledger {
         stamp: capture_stamp(began_at, started),
         value: Shared {
             meminfo,
-            coverage: process_tree.coverage,
-            objects: fold_shared_objects(&process_tree, &sysv_segments),
+            coverage,
+            objects,
         },
         warnings,
     })
 }
 
-pub fn tmpfs_mount_points() -> Result<Vec<PathBuf>> {
-    let mount_index = MountIndex::read().wrap_err("failed to read /proc/self/mountinfo")?;
-    Ok(unique_tmpfs_infos(&mount_index)
-        .into_iter()
-        .map(|info| info.mount_point)
-        .collect())
-}
-
-pub fn capture_tmpfs_mount(path: &Path) -> Result<Ledger<TmpfsMount>> {
+pub fn capture_tmpfs() -> Result<Ledger<Tmpfs>> {
     let began_at = SystemTime::now();
     let started = Instant::now();
     let mount_index = MountIndex::read().wrap_err("failed to read /proc/self/mountinfo")?;
-    let info = mount_index
-        .match_tmpfs_mount(path)
-        .cloned()
-        .ok_or_else(|| eyre!("no tmpfs mount contains {}", path.display()))?;
-    let mount = scan_tmpfs_mount(&info)?;
+    let discovered_mounts = mount_index.tmpfs.len();
+    let infos = unique_tmpfs_infos(&mount_index);
+    let mut coverage = TmpfsCoverage {
+        discovered_mounts,
+        unique_filesystems: infos.len(),
+        ..TmpfsCoverage::default()
+    };
+    let mut warnings = Vec::new();
+    let mut mounts = Vec::with_capacity(infos.len());
+    for info in infos {
+        match scan_tmpfs_mount(&info, &mut coverage) {
+            Ok(mount) => mounts.push(mount),
+            Err(error) => {
+                coverage.inaccessible_filesystems += 1;
+                warnings.push(format!(
+                    "tmpfs {} was not captured: {error}",
+                    info.mount_point.display()
+                ));
+            }
+        }
+    }
+    coverage.captured_filesystems = mounts.len();
+    mounts.sort_by_key(|mount| Reverse(mount.root.allocated));
+    let allocated_total = mounts
+        .iter()
+        .map(|mount| mount.root.allocated)
+        .fold(Bytes::ZERO, |total, allocated| total + allocated);
+    if coverage.walk_errors > 0 {
+        warnings.push(format!(
+            "{} tmpfs entries vanished or were inaccessible during traversal",
+            coverage.walk_errors
+        ));
+    }
 
     Ok(Ledger {
         stamp: capture_stamp(began_at, started),
-        value: mount,
-        warnings: Vec::new(),
+        value: Tmpfs {
+            mounts,
+            allocated_total,
+            coverage,
+        },
+        warnings,
     })
 }
 
 #[derive(Clone, Debug)]
 struct MountInfo {
     mount_point: PathBuf,
+    device_major: u32,
+    device_minor: u32,
     fs_type: String,
     source: String,
     super_options: String,
@@ -331,11 +355,10 @@ struct TmpfsBuilder {
     path: PathBuf,
     name: String,
     kind: TmpfsNodeKind,
-    own_allocated: Bytes,
-    own_logical: Bytes,
     allocated: Bytes,
     logical: Bytes,
-    children: Vec<PathBuf>,
+    parent: Option<usize>,
+    children: Vec<usize>,
 }
 
 impl MountIndex {
@@ -375,9 +398,14 @@ fn parse_mountinfo_line(line: &str) -> Option<MountInfo> {
     if left_fields.len() < 5 || right_fields.len() < 3 {
         return None;
     }
+    let (device_major, device_minor) = left_fields[2].split_once(':')?;
+    let device_major = device_major.parse().ok()?;
+    let device_minor = device_minor.parse().ok()?;
 
     Some(MountInfo {
         mount_point: PathBuf::from(unescape_mount_field(left_fields[4])),
+        device_major,
+        device_minor,
         fs_type: right_fields[0].to_string(),
         source: right_fields[1].to_string(),
         super_options: right_fields[2..].join(" "),
@@ -605,7 +633,6 @@ fn scan_process_shell(
         state: status.state,
         threads: status.threads,
         memory,
-        objects: Vec::new(),
         mappings_state: LedgerState::Deferred,
     }))
 }
@@ -640,37 +667,133 @@ fn finish_process_coverage(processes: &[ProcessRecord], coverage: &mut ProcessCo
         .count();
 }
 
-fn attach_all_mapping_ledgers(
-    processes: &mut [ProcessRecord],
+#[derive(Debug)]
+struct SharedProcess {
+    key: ProcessKey,
+    name: String,
+    command: String,
+    objects: Vec<ObjectUsage>,
+    mappings_state: LedgerState,
+    warning: Option<String>,
+}
+
+struct SharedAccumulator {
+    backing: BackingIdentity,
+    kind: ObjectKind,
+    label: String,
+    rollup: MemoryRollup,
+    regions: usize,
+    consumers: Vec<ObjectConsumer>,
+}
+
+fn scan_shared_objects(
     mount_index: &MountIndex,
+    sysv_segments: &[SysvSegment],
     warnings: &mut Vec<String>,
-) {
-    for process in processes.iter_mut() {
-        let rollup = process.rollup();
-        if rollup.rss == Bytes::ZERO && rollup.pss == Bytes::ZERO {
-            continue;
-        }
-        let key = process.key();
-        let root = PathBuf::from("/proc").join(process.pid.0.to_string());
-        match fs::read_to_string(root.join("smaps")) {
-            Ok(text) => {
-                if verify_process_key(&root, key).is_ok() {
-                    process.objects = parse_smaps(&text, mount_index, key);
-                    process.mappings_state = LedgerState::Exact;
-                } else {
-                    process.mappings_state = LedgerState::Inaccessible;
-                    warnings.push(format!(
-                        "pid {} changed identity during smaps capture",
-                        key.pid
-                    ));
-                }
-            }
+) -> Result<(Vec<SharedObject>, ProcessCoverage)> {
+    let mut coverage = ProcessCoverage::default();
+    let mut objects = BTreeMap::<BackingIdentity, SharedAccumulator>::new();
+    for entry in fs::read_dir("/proc")? {
+        let entry = match entry {
+            Ok(entry) => entry,
             Err(error) => {
-                process.mappings_state = LedgerState::Inaccessible;
-                warnings.push(format!("pid {} smaps unavailable: {error}", key.pid));
+                warnings.push(format!("ignoring /proc entry: {error}"));
+                continue;
+            }
+        };
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        coverage.candidates += 1;
+        match scan_shared_process(Pid(pid), mount_index) {
+            Ok(Some(process)) => {
+                coverage.captured += 1;
+                match process.mappings_state {
+                    LedgerState::Exact => coverage.exact_maps += 1,
+                    LedgerState::Inaccessible => coverage.inaccessible_maps += 1,
+                    LedgerState::Deferred | LedgerState::Approximate => {}
+                }
+                if let Some(warning) = &process.warning {
+                    warnings.push(warning.clone());
+                }
+                absorb_shared_process(&mut objects, process);
+            }
+            Ok(None) => coverage.vanished += 1,
+            Err(error) => {
+                coverage.inaccessible += 1;
+                warnings.push(format!(
+                    "pid {pid} shared mappings were not captured: {error}"
+                ));
             }
         }
     }
+    Ok((finalize_shared_objects(objects, sysv_segments), coverage))
+}
+
+fn absorb_shared_process(
+    objects: &mut BTreeMap<BackingIdentity, SharedAccumulator>,
+    process: SharedProcess,
+) {
+    for object in process.objects {
+        let entry = objects
+            .entry(object.backing.clone())
+            .or_insert_with(|| SharedAccumulator {
+                backing: object.backing.clone(),
+                kind: object.kind,
+                label: object.label.clone(),
+                rollup: MemoryRollup::default(),
+                regions: 0,
+                consumers: Vec::new(),
+            });
+        entry.rollup += object.rollup;
+        entry.regions += object.regions;
+        entry.consumers.push(ObjectConsumer {
+            pid: process.key.pid,
+            name: process.name.clone(),
+            command: process.command.clone(),
+            rollup: object.rollup,
+        });
+    }
+}
+
+fn scan_shared_process(pid: Pid, mount_index: &MountIndex) -> Result<Option<SharedProcess>> {
+    let root = PathBuf::from("/proc").join(pid.0.to_string());
+    let key = match read_process_key(&root, pid) {
+        Ok(key) => key,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let name = fs::read_to_string(root.join("comm"))
+        .map(|name| name.trim_end().to_string())
+        .unwrap_or_else(|_| pid.to_string());
+    let command = read_cmdline(&root).unwrap_or_else(|| name.clone());
+    let (objects, mappings_state, warning) = match fs::read_to_string(root.join("smaps")) {
+        Ok(text) => (
+            parse_smaps(&text, mount_index, key),
+            LedgerState::Exact,
+            None,
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => (
+            Vec::new(),
+            LedgerState::Inaccessible,
+            Some(format!("pid {pid} smaps unavailable: {error}")),
+        ),
+    };
+    match read_process_key(&root, pid) {
+        Ok(observed) if observed == key => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    Ok(Some(SharedProcess {
+        key,
+        name,
+        command,
+        objects,
+        mappings_state,
+        warning,
+    }))
 }
 
 #[derive(Clone, Debug)]
@@ -1121,44 +1244,10 @@ fn accumulate_subtree(index: usize, nodes: &mut [ProcessNode]) -> MemoryRollup {
     subtotal
 }
 
-fn fold_shared_objects(
-    process_tree: &ProcessTree,
+fn finalize_shared_objects(
+    objects: BTreeMap<BackingIdentity, SharedAccumulator>,
     sysv_segments: &[SysvSegment],
 ) -> Vec<SharedObject> {
-    struct Accumulator {
-        backing: BackingIdentity,
-        kind: ObjectKind,
-        label: String,
-        rollup: MemoryRollup,
-        regions: usize,
-        consumers: Vec<ObjectConsumer>,
-    }
-
-    let mut objects = BTreeMap::<BackingIdentity, Accumulator>::new();
-
-    for node in &process_tree.nodes {
-        for object in &node.objects {
-            let entry = objects
-                .entry(object.backing.clone())
-                .or_insert_with(|| Accumulator {
-                    backing: object.backing.clone(),
-                    kind: object.kind,
-                    label: object.label.clone(),
-                    rollup: MemoryRollup::default(),
-                    regions: 0,
-                    consumers: Vec::new(),
-                });
-            entry.rollup += object.rollup;
-            entry.regions += object.regions;
-            entry.consumers.push(ObjectConsumer {
-                pid: node.pid,
-                name: node.name.clone(),
-                command: node.command.clone(),
-                rollup: object.rollup,
-            });
-        }
-    }
-
     let mut rows = objects
         .into_values()
         .map(|mut acc| {
@@ -1234,119 +1323,93 @@ fn unique_tmpfs_infos(mount_index: &MountIndex) -> Vec<MountInfo> {
     infos.sort_by_key(|info| info.mount_point.as_os_str().len());
 
     for info in infos {
-        match fs::symlink_metadata(&info.mount_point) {
-            Ok(metadata) if seen_devices.insert(metadata.dev()) => {}
-            Ok(_) => continue,
-            Err(_) => continue,
+        if !seen_devices.insert((info.device_major, info.device_minor)) {
+            continue;
         }
-
         unique.push(info.clone());
     }
 
     unique
 }
 
-fn scan_tmpfs_mount(info: &MountInfo) -> Result<TmpfsMount> {
+fn scan_tmpfs_mount(info: &MountInfo, coverage: &mut TmpfsCoverage) -> Result<TmpfsMount> {
     let root_meta = fs::symlink_metadata(&info.mount_point)?;
     let mut seen_storage = BTreeSet::<(u64, u64)>::new();
     let _ = seen_storage.insert((root_meta.dev(), root_meta.ino()));
-    let mut nodes = BTreeMap::<PathBuf, TmpfsBuilder>::new();
-    let _ = nodes.insert(
-        info.mount_point.clone(),
-        TmpfsBuilder {
-            path: info.mount_point.clone(),
-            name: info.mount_point.display().to_string(),
-            kind: TmpfsNodeKind::Mount,
-            own_allocated: metadata_allocated(&root_meta),
-            own_logical: metadata_logical(&root_meta),
-            allocated: Bytes::ZERO,
-            logical: Bytes::ZERO,
-            children: Vec::new(),
-        },
-    );
+    let mut nodes = vec![TmpfsBuilder {
+        path: info.mount_point.clone(),
+        name: info.mount_point.display().to_string(),
+        kind: TmpfsNodeKind::Mount,
+        allocated: metadata_allocated(&root_meta),
+        logical: metadata_logical(&root_meta),
+        parent: None,
+        children: Vec::new(),
+    }];
+    let mut ancestors = vec![0usize];
 
-    for entry in WalkDir::new(&info.mount_point)
+    let mut walk = WalkDir::new(&info.mount_point)
         .same_file_system(true)
         .follow_links(false)
-    {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => continue,
+        .into_iter();
+    while let Some(entry) = walk.next() {
+        let entry = if let Ok(entry) = entry {
+            entry
+        } else {
+            coverage.walk_errors += 1;
+            walk.skip_current_dir();
+            continue;
         };
         let path = entry.path();
         if path == info.mount_point {
             continue;
         }
 
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
+        let metadata = if let Ok(metadata) = entry.metadata() {
+            metadata
+        } else {
+            coverage.walk_errors += 1;
+            walk.skip_current_dir();
+            continue;
         };
 
-        let path_buf = path.to_path_buf();
         let first_storage_name = seen_storage.insert((metadata.dev(), metadata.ino()));
-        let own_allocated = if first_storage_name {
+        let allocated = if first_storage_name {
             metadata_allocated(&metadata)
         } else {
             Bytes::ZERO
         };
-        let own_logical = if first_storage_name {
+        let logical = if first_storage_name {
             metadata_logical(&metadata)
         } else {
             Bytes::ZERO
         };
-        let parent = path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| info.mount_point.clone());
-        nodes
-            .entry(parent.clone())
-            .or_insert_with(|| TmpfsBuilder {
-                path: parent.clone(),
-                name: basename(&parent),
-                kind: TmpfsNodeKind::Directory,
-                own_allocated: Bytes::ZERO,
-                own_logical: Bytes::ZERO,
-                allocated: Bytes::ZERO,
-                logical: Bytes::ZERO,
-                children: Vec::new(),
-            })
-            .children
-            .push(path_buf.clone());
-
-        let _ = nodes.insert(
-            path_buf.clone(),
-            TmpfsBuilder {
-                path: path_buf,
-                name: basename(path),
-                kind: classify_tmpfs_entry(&metadata),
-                own_allocated,
-                own_logical,
-                allocated: Bytes::ZERO,
-                logical: Bytes::ZERO,
-                children: Vec::new(),
-            },
-        );
+        let depth = entry.depth();
+        let parent = ancestors.get(depth.saturating_sub(1)).copied().unwrap_or(0);
+        let index = nodes.len();
+        nodes[parent].children.push(index);
+        nodes.push(TmpfsBuilder {
+            path: path.to_path_buf(),
+            name: basename(path),
+            kind: classify_tmpfs_entry(&metadata),
+            allocated,
+            logical,
+            parent: Some(parent),
+            children: Vec::new(),
+        });
+        ancestors.truncate(depth);
+        ancestors.push(index);
     }
 
-    let mut ordered = nodes.keys().cloned().collect::<Vec<_>>();
-    ordered.sort_by_key(|path| Reverse(path.components().count()));
-    for path in ordered {
-        let Some(node) = nodes.get_mut(&path) else {
-            continue;
-        };
-        node.allocated += node.own_allocated;
-        node.logical += node.own_logical;
-        let allocated = node.allocated;
-        let logical = node.logical;
-        let parent = path.parent().map(Path::to_path_buf);
-        if let Some(parent) = parent.and_then(|parent| nodes.get_mut(&parent)) {
-            parent.allocated += allocated;
-            parent.logical += logical;
-        }
+    for index in (1..nodes.len()).rev() {
+        let parent = nodes[index].parent.unwrap_or(0);
+        let allocated = nodes[index].allocated;
+        let logical = nodes[index].logical;
+        nodes[parent].allocated += allocated;
+        nodes[parent].logical += logical;
     }
 
-    let root = materialize_tmpfs_node(&info.mount_point, &mut nodes)?;
+    let mut nodes = nodes.into_iter().map(Some).collect::<Vec<_>>();
+    let root = materialize_tmpfs_node(0, &mut nodes)?;
     Ok(TmpfsMount {
         mount_point: info.mount_point.clone(),
         source: info.source.clone(),
@@ -1355,18 +1418,16 @@ fn scan_tmpfs_mount(info: &MountInfo) -> Result<TmpfsMount> {
     })
 }
 
-fn materialize_tmpfs_node(
-    path: &Path,
-    nodes: &mut BTreeMap<PathBuf, TmpfsBuilder>,
-) -> Result<TmpfsNode> {
+fn materialize_tmpfs_node(index: usize, nodes: &mut [Option<TmpfsBuilder>]) -> Result<TmpfsNode> {
     let builder = nodes
-        .remove(path)
-        .ok_or_else(|| eyre!("tmpfs tree lost indexed node {}", path.display()))?;
+        .get_mut(index)
+        .and_then(Option::take)
+        .ok_or_else(|| eyre!("tmpfs tree lost arena node {index}"))?;
 
     let mut children = builder
         .children
         .iter()
-        .map(|child| materialize_tmpfs_node(child, nodes))
+        .map(|child| materialize_tmpfs_node(*child, nodes))
         .collect::<Result<Vec<_>>>()?;
     children.sort_by(|lhs, rhs| {
         rhs.allocated
@@ -1505,7 +1566,6 @@ mod tests {
                 rss: Bytes(pss),
                 ..MemoryRollup::default()
             }),
-            objects: Vec::new(),
             mappings_state: LedgerState::Deferred,
         }
     }
@@ -1532,6 +1592,7 @@ mod tests {
         let line = "839 811 0:34 / /tmp rw,nosuid,nodev master:17 - tmpfs tmpfs rw,size=65909960k";
         let parsed = parse_mountinfo_line(line).expect("mountinfo");
         assert_eq!(parsed.mount_point, PathBuf::from("/tmp"));
+        assert_eq!((parsed.device_major, parsed.device_minor), (0, 34));
         assert_eq!(parsed.fs_type, "tmpfs");
         assert_eq!(parsed.source, "tmpfs");
     }

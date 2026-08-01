@@ -324,9 +324,9 @@ const TMPFS_ACTIONS: &[Binding] = &[
     ),
     binding!(
         "r",
-        "refresh only the selected tmpfs mount",
+        "replace the complete tmpfs capture generation",
         "r",
-        "refresh mount",
+        "refresh",
         commands![(Chord::Char('r'), Action::Refresh)]
     ),
 ];

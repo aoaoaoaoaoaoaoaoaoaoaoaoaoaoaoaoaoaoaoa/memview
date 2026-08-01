@@ -70,6 +70,7 @@ fn tmpfs_ledger(mounts: Vec<TmpfsMount>) -> Ledger<Tmpfs> {
     ledger(Tmpfs {
         mounts,
         allocated_total,
+        coverage: super::super::model::TmpfsCoverage::default(),
     })
 }
 
@@ -103,7 +104,6 @@ fn process_node(pid: i32, command: &str, cwd: Option<&str>) -> ProcessNode {
             state: "S".to_string(),
             threads: 1,
             memory: ProcessMemory::Smaps(rollup),
-            objects: Vec::new(),
             mappings_state: LedgerState::Deferred,
         },
         subtree: rollup,
@@ -238,6 +238,24 @@ fn tmpfs_background_rebuilds_stay_pinned_to_top_until_user_entry() {
         app.tmpfs_rows.selected().map(|row| row.path.as_path()),
         Some(Path::new("/tmpfs-big"))
     );
+}
+
+#[test]
+fn tmpfs_capture_generation_replaces_vanished_mounts() {
+    let mut app = App::new(UiState::default());
+    app.apply_tmpfs_result(Ok(Box::new(tmpfs_ledger(vec![
+        tmpfs_mount("/old", Bytes(2)),
+        tmpfs_mount("/live", Bytes(1)),
+    ]))));
+    app.apply_tmpfs_result(Ok(Box::new(tmpfs_ledger(vec![tmpfs_mount(
+        "/live",
+        Bytes(3),
+    )]))));
+
+    let tmpfs = app.tmpfs().expect("tmpfs generation installed");
+    assert_eq!(tmpfs.mounts.len(), 1);
+    assert_eq!(tmpfs.mounts[0].mount_point, PathBuf::from("/live"));
+    assert_eq!(tmpfs.allocated_total, Bytes(3));
 }
 
 #[test]

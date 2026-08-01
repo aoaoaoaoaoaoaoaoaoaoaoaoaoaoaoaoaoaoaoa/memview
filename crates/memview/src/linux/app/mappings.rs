@@ -1,7 +1,7 @@
 use super::super::model::{LedgerState, ObjectUsage, Pid, ProcessKey};
 use super::super::probe;
 use color_eyre::eyre::{Result, ensure};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 struct MappingLedger {
@@ -31,19 +31,19 @@ enum MappingState {
 
 #[derive(Default)]
 pub(super) struct MappingLedgers {
-    states: BTreeMap<ProcessKey, MappingState>,
+    selected: Option<(ProcessKey, MappingState)>,
 }
 
 impl MappingLedgers {
     pub(super) fn begin(&mut self, key: ProcessKey) -> bool {
-        if self.states.contains_key(&key) {
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|(selected, _)| *selected == key)
+        {
             return false;
         }
-        self.states
-            .retain(|_, state| matches!(state, MappingState::Ready(_)));
-        let _ = self
-            .states
-            .insert(key, MappingState::Loading(Instant::now()));
+        self.selected = Some((key, MappingState::Loading(Instant::now())));
         true
     }
 
@@ -54,79 +54,110 @@ impl MappingLedgers {
     ) -> Result<()> {
         match result {
             Ok(scan) => {
-                let _ = self.states.remove(&expected);
+                if scan.key != expected
+                    && self
+                        .selected
+                        .as_ref()
+                        .is_some_and(|(selected, _)| *selected == expected)
+                {
+                    self.selected = None;
+                }
                 ensure!(
                     scan.key == expected,
                     "mapping worker returned {} for requested {expected}",
                     scan.key
                 );
-                let _ = self
-                    .states
-                    .insert(expected, MappingState::Ready((*scan).into()));
+                if self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|(selected, _)| *selected == expected)
+                {
+                    self.selected = Some((expected, MappingState::Ready((*scan).into())));
+                }
                 Ok(())
             }
             Err(error) => {
-                let _ = self.states.remove(&expected);
-                Err(error)
+                if self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|(selected, _)| *selected == expected)
+                {
+                    self.selected = None;
+                    Err(error)
+                } else {
+                    Ok(())
+                }
             }
         }
     }
 
     pub(super) fn retain(&mut self, live: &BTreeSet<ProcessKey>) {
-        self.states.retain(|key, _| live.contains(key));
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|(key, _)| !live.contains(key))
+        {
+            self.selected = None;
+        }
     }
 
     pub(super) fn clear(&mut self) {
-        self.states.clear();
+        self.selected = None;
     }
 
     pub(super) fn objects(&self, key: ProcessKey) -> &[ObjectUsage] {
-        match self.states.get(&key) {
-            Some(MappingState::Ready(ledger)) => &ledger.objects,
-            Some(MappingState::Loading(_)) | None => &[],
+        match &self.selected {
+            Some((selected, MappingState::Ready(ledger))) if *selected == key => &ledger.objects,
+            Some((_, MappingState::Loading(_) | MappingState::Ready(_))) | None => &[],
         }
     }
 
     pub(super) fn state(&self, key: ProcessKey, fallback: LedgerState) -> &'static str {
-        match self.states.get(&key) {
-            Some(MappingState::Loading(_)) => "loading",
-            Some(MappingState::Ready(ledger)) => ledger.state.label(),
-            None => fallback.label(),
+        match &self.selected {
+            Some((selected, MappingState::Loading(_))) if *selected == key => "loading",
+            Some((selected, MappingState::Ready(ledger))) if *selected == key => {
+                ledger.state.label()
+            }
+            Some((_, MappingState::Loading(_) | MappingState::Ready(_))) | None => fallback.label(),
         }
     }
 
     pub(super) fn loading(&self, key: ProcessKey) -> Option<Duration> {
-        match self.states.get(&key)? {
-            MappingState::Loading(started) => Some(started.elapsed()),
-            MappingState::Ready(_) => None,
+        match self.selected.as_ref()? {
+            (selected, MappingState::Loading(started)) if *selected == key => {
+                Some(started.elapsed())
+            }
+            (_, MappingState::Loading(_) | MappingState::Ready(_)) => None,
         }
     }
 
     pub(super) fn scan_label(&self, key: ProcessKey) -> String {
-        match self.states.get(&key) {
-            Some(MappingState::Loading(started)) => {
+        match &self.selected {
+            Some((selected, MappingState::Loading(started))) if *selected == key => {
                 format!(
                     "loading pid {}: {} ms",
                     key.pid,
                     started.elapsed().as_millis()
                 )
             }
-            Some(MappingState::Ready(ledger)) => format!(
+            Some((selected, MappingState::Ready(ledger))) if *selected == key => format!(
                 "{} ms (mount {} read {} parse {})",
                 ledger.elapsed.as_millis(),
                 ledger.cost.mount_index.as_millis(),
                 ledger.cost.read.as_millis(),
                 ledger.cost.parse.as_millis()
             ),
-            None => "not loaded".to_string(),
+            Some((_, MappingState::Loading(_) | MappingState::Ready(_))) | None => {
+                "not loaded".to_string()
+            }
         }
     }
 
     pub(super) fn first_loading(&self) -> Option<(Pid, Instant)> {
-        self.states.iter().find_map(|(key, state)| match state {
-            MappingState::Loading(started) => Some((key.pid, *started)),
-            MappingState::Ready(_) => None,
-        })
+        match self.selected.as_ref()? {
+            (key, MappingState::Loading(started)) => Some((key.pid, *started)),
+            (_, MappingState::Ready(_)) => None,
+        }
     }
 
     pub(super) fn is_loading(&self) -> bool {
@@ -134,7 +165,7 @@ impl MappingLedgers {
     }
 
     pub(super) fn warnings(&self) -> impl Iterator<Item = &str> {
-        self.states.values().flat_map(|state| match state {
+        self.selected.iter().flat_map(|(_, state)| match state {
             MappingState::Loading(_) => [].iter().map(String::as_str),
             MappingState::Ready(ledger) => ledger.warnings.iter().map(String::as_str),
         })
@@ -169,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_loading_request_coexists_with_an_older_result() {
+    fn latest_selection_supersedes_and_discards_an_older_result() {
         let first = key(1);
         let second = key(2);
         let mut ledgers = MappingLedgers::default();
@@ -183,8 +214,12 @@ mod tests {
         ledgers
             .finish(first, Ok(scan(first)))
             .expect("valid result");
-        assert_eq!(ledgers.state(first, LedgerState::Deferred), "exact");
+        assert_eq!(ledgers.state(first, LedgerState::Deferred), "deferred");
         assert_eq!(ledgers.state(second, LedgerState::Deferred), "loading");
+        ledgers
+            .finish(second, Ok(scan(second)))
+            .expect("valid result");
+        assert_eq!(ledgers.state(second, LedgerState::Deferred), "exact");
     }
 
     #[test]
