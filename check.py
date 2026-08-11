@@ -166,8 +166,7 @@ def verify_generated_licenses() -> None:
         generated = Path(scratch) / "THIRD-PARTY-LICENSES.html"
         proc = subprocess.run(
             (
-                "cargo",
-                "about",
+                "cargo-about",
                 "generate",
                 "--locked",
                 "--fail",
