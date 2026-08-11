@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root"
+
+command -v cargo-audit >/dev/null 2>&1 || {
+    printf '%s\n' 'cargo-audit is required: cargo install cargo-audit --version 0.22.2 --locked' >&2
+    exit 1
+}
+cargo audit --deny warnings

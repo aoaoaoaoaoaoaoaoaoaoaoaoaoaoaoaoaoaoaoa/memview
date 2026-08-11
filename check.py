@@ -251,9 +251,10 @@ def verify_terminal_exit(binary: Path, exit_signal: signal.Signals | None) -> No
         raise SystemExit(f"[check] alternate-screen restoration absent for {exit_signal or 'quit'}")
 
 
-def verify_terminal_lifecycle() -> None:
-    run("terminal.build", ("cargo", "build", "--locked", "-p", "memview"))
-    binary = binary_path()
+def verify_terminal_lifecycle(binary: Path | None = None) -> None:
+    if binary is None:
+        run("terminal.build", ("cargo", "build", "--locked", "-p", "memview"))
+        binary = binary_path()
     print("[check] terminal: non-TTY, quit, SIGHUP, SIGTERM", flush=True)
     non_tty = subprocess.run(
         (str(binary),), cwd=ROOT, stdin=subprocess.DEVNULL, capture_output=True, text=True
@@ -269,12 +270,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "mode",
         nargs="?",
-        choices=("check", "verify", "deep", "fix", "canon", "install"),
+        choices=("check", "source", "verify", "deep", "lifecycle", "fix", "canon", "install"),
         default="check",
         help=(
-            "Run canonicalization plus the fast gate, run a non-mutating verification gate, "
-            "include docs for the deep gate, run only canonicalization, or install locally."
+            "Run canonicalization plus the fast gate, run a non-mutating source or complete "
+            "verification gate, prove one installed lifecycle, include docs for the deep gate, "
+            "run only canonicalization, or install locally."
         ),
+    )
+    parser.add_argument(
+        "--binary",
+        type=Path,
+        help="Installed memview executable for lifecycle mode.",
     )
     return parser.parse_args()
 
@@ -337,23 +344,34 @@ def main() -> None:
     source_file_policy = load_source_file_policy(metadata)
     args = parse_args()
 
+    if args.mode == "lifecycle":
+        if args.binary is None or not args.binary.is_file():
+            raise SystemExit("[check] lifecycle requires --binary pointing to an installed memview")
+        verify_terminal_lifecycle(args.binary)
+        return
+    if args.binary is not None:
+        raise SystemExit("[check] --binary belongs only to lifecycle mode")
+
     if args.mode in {"fix", "canon"}:
         run_command_sequence("canonicalize", commands["canonicalize_commands"])
         return
 
     enforce_source_file_policy(source_file_policy)
     verify_python_sources()
-    if args.mode != "verify":
+    if args.mode not in {"source", "verify"}:
         run_command_sequence("canonicalize", commands["canonicalize_commands"])
 
     run("fmt", commands["format_command"])
     run("clippy", commands["clippy_command"])
     run("test", commands["test_command"])
 
-    if args.mode in {"verify", "deep", "install"} and "doc_command" in commands:
+    if args.mode in {"source", "verify", "deep", "install"} and "doc_command" in commands:
         run("doc", commands["doc_command"])
+    if args.mode in {"verify", "deep", "install"}:
         run("audit", ("cargo", "audit"))
+    if args.mode in {"source", "verify", "deep", "install"}:
         verify_generated_licenses()
+    if args.mode in {"verify", "deep", "install"}:
         verify_terminal_lifecycle()
     if args.mode == "install":
         run("install", commands["install_command"])

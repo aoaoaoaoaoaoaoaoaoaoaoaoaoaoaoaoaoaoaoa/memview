@@ -1,0 +1,50 @@
+schema = 1
+
+[product]
+name = "memview"
+package = "memview"
+binary = "memview"
+profile = "platform-bound"
+
+[coordinates]
+release-tested = ["linux-x86_64"]
+
+[[exclusions]]
+coordinate = "macos-aarch64"
+reason = "The product reconciles Linux procfs, tmpfs, SysV memory, and kernel counters."
+
+[[exclusions]]
+coordinate = "macos-x86_64"
+reason = "The product reconciles Linux procfs, tmpfs, SysV memory, and kernel counters."
+
+[[exclusions]]
+coordinate = "windows-x86_64"
+reason = "The product reconciles Linux procfs, tmpfs, SysV memory, and kernel counters."
+
+[delivery]
+linux = "cargo"
+
+[[proofs]]
+name = "source"
+laws = ["source"]
+run = ["scripts/check-foundry"]
+timeout-minutes = 45
+
+[[proofs]]
+name = "security"
+laws = ["security"]
+run = ["scripts/audit"]
+timeout-minutes = 15
+
+[[proofs]]
+name = "source-package"
+laws = ["source-package"]
+run = ["scripts/package"]
+timeout-minutes = 30
+
+[[proofs]]
+name = "runtime"
+laws = ["host", "lifecycle"]
+run = ["scripts/prove-runtime"]
+coordinates = ["linux-x86_64"]
+timeout-minutes = 45

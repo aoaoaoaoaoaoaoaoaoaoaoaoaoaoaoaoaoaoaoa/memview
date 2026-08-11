@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+cell=$(mktemp -d "${TMPDIR:-/tmp}/memview-lifecycle.XXXXXX")
+trap 'rm -rf -- "$cell"' EXIT HUP INT TERM
+cd "$root"
+
+cargo install --locked --force --path crates/memview --root "$cell/prefix"
+binary=$cell/prefix/bin/memview
+test -x "$binary"
+./check.py lifecycle --binary "$binary"
+mkdir -p "$cell/state/memview"
+printf '%s\n' preserved >"$cell/state/memview/uninstall-sentinel"
+cargo uninstall --root "$cell/prefix" memview
+test ! -e "$binary"
+test -f "$cell/state/memview/uninstall-sentinel"
