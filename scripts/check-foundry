@@ -3,6 +3,6 @@ set -eu
 
 if ! command -v cargo-about >/dev/null 2>&1 ||
     [ "$(cargo-about --version)" != 'cargo-about 0.9.1' ]; then
-    cargo install cargo-about --version 0.9.1 --locked
+    cargo install cargo-about --version 0.9.1 --locked --features cli
 fi
 exec ./check.py source
