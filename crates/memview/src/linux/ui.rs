@@ -841,7 +841,7 @@ fn row_tmpfs<'a>(
     let name = node
         .path
         .file_name()
-        .map_or_else(|| node.path.as_os_str(), |name| name)
+        .unwrap_or_else(|| node.path.as_os_str())
         .to_string_lossy();
     let label = format!("{}{} {name}", "  ".repeat(row.depth), marker);
     Row::new(vec![

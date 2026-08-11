@@ -9,13 +9,19 @@ permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   foundry:
     name: Foundry
     permissions:
+      contents: read
+    uses: aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/eternalist-foundry/.github/workflows/pipeline.yml@a4aa93aa3981a6238c6fdd0e29970916e432f953
+
+  release:
+    name: Release
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    needs: foundry
+    permissions:
       contents: write
-    uses: aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/eternalist-foundry/.github/workflows/pipeline.yml@434df1d663ea0cf4e8836dc7235b9fdc4a1d6a1b
-    with:
-      publish: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    uses: aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/eternalist-foundry/.github/workflows/publish.yml@a4aa93aa3981a6238c6fdd0e29970916e432f953
