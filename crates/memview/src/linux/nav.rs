@@ -108,11 +108,23 @@ pub enum Action {
     Move(isize),
     PageUp,
     PageDown,
+    Fold(FoldAction),
+    FirstRow,
+    LastRow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FoldAction {
     Collapse,
     Expand,
     Toggle,
-    FirstRow,
-    LastRow,
+    CollapseRecursive,
+    ExpandRecursive,
+    ToggleRecursive,
+    CollapseAll,
+    ExpandAll,
+    RevealLevel,
+    HideLevel,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -120,10 +132,11 @@ enum Chord {
     Char(char),
     Code(KeyCode),
     Control(char),
+    Pair(char, char),
 }
 
 impl Chord {
-    fn matches(&self, key: KeyEvent) -> bool {
+    fn matches_key(&self, key: KeyEvent) -> bool {
         let command_modifier = key.modifiers.intersects(
             KeyModifiers::CONTROL
                 | KeyModifiers::ALT
@@ -138,7 +151,16 @@ impl Chord {
                 key.code == KeyCode::Char(*character)
                     && key.modifiers.contains(KeyModifiers::CONTROL)
             }
+            Self::Pair(_, _) => false,
         }
+    }
+
+    fn begins_with(&self, prefix: char) -> bool {
+        matches!(self, Self::Pair(first, _) if *first == prefix)
+    }
+
+    fn matches_pair(&self, prefix: char, suffix: char) -> bool {
+        matches!(self, Self::Pair(first, second) if (*first, *second) == (prefix, suffix))
     }
 }
 
@@ -167,8 +189,55 @@ impl Binding {
     pub fn resolve(&self, key: KeyEvent) -> Option<Action> {
         self.commands
             .iter()
-            .find(|command| command.chord.matches(key))
+            .find(|command| command.chord.matches_key(key))
             .map(|command| command.action)
+    }
+
+    fn begins_with(&self, prefix: char) -> bool {
+        self.commands
+            .iter()
+            .any(|command| command.chord.begins_with(prefix))
+    }
+
+    fn resolve_pair(&self, prefix: char, suffix: char) -> Option<Action> {
+        self.commands
+            .iter()
+            .find(|command| command.chord.matches_pair(prefix, suffix))
+            .map(|command| command.action)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Resolution {
+    Ignored,
+    Pending,
+    Command(Action),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Keymap {
+    prefix: Option<char>,
+}
+
+impl Keymap {
+    pub fn resolve(&mut self, tab: Tab, key: KeyEvent) -> Resolution {
+        if let Some(prefix) = self.prefix.take() {
+            return plain_char(key)
+                .and_then(|suffix| resolve_pair(tab, prefix, suffix))
+                .map_or(Resolution::Ignored, Resolution::Command);
+        }
+        if let Some(action) = resolve(tab, key) {
+            return Resolution::Command(action);
+        }
+        if let Some(prefix) = plain_char(key).filter(|prefix| begins_sequence(tab, *prefix)) {
+            self.prefix = Some(prefix);
+            return Resolution::Pending;
+        }
+        Resolution::Ignored
+    }
+
+    pub fn cancel(&mut self) {
+        self.prefix = None;
     }
 }
 
@@ -287,7 +356,16 @@ const TREE_NAVIGATION: &[Binding] = &[
             (Chord::Code(KeyCode::Up), Action::Move(-1)),
         ]
     ),
-    binding!("gg / G", "jump to first or last row", "gg/G", "edge", &[]),
+    binding!(
+        "gg / G",
+        "jump to first or last row",
+        "gg/G",
+        "edge",
+        commands![
+            (Chord::Pair('g', 'g'), Action::FirstRow),
+            (Chord::Char('G'), Action::LastRow),
+        ]
+    ),
     binding!(
         "PgUp / PgDn",
         "move selection by one visible pane",
@@ -301,18 +379,70 @@ const TREE_NAVIGATION: &[Binding] = &[
         "h/l / Left/Right",
         "collapse or expand selected subtree",
         commands![
-            (Chord::Char('h'), Action::Collapse),
-            (Chord::Code(KeyCode::Left), Action::Collapse),
-            (Chord::Char('l'), Action::Expand),
-            (Chord::Code(KeyCode::Right), Action::Expand),
+            (Chord::Char('h'), Action::Fold(FoldAction::Collapse)),
+            (
+                Chord::Code(KeyCode::Left),
+                Action::Fold(FoldAction::Collapse)
+            ),
+            (Chord::Char('l'), Action::Fold(FoldAction::Expand)),
+            (
+                Chord::Code(KeyCode::Right),
+                Action::Fold(FoldAction::Expand)
+            ),
         ]
     ),
     binding!(
         "Enter",
         "toggle selected subtree fold, including auto-folds",
-        "Enter",
+        commands![(
+            Chord::Code(KeyCode::Enter),
+            Action::Fold(FoldAction::Toggle)
+        )]
+    ),
+    binding!(
+        "za / zo / zc",
+        "toggle, expand, or collapse the selected fold",
+        "z…",
         "fold",
-        commands![(Chord::Code(KeyCode::Enter), Action::Toggle)]
+        commands![
+            (Chord::Pair('z', 'a'), Action::Fold(FoldAction::Toggle)),
+            (Chord::Pair('z', 'o'), Action::Fold(FoldAction::Expand)),
+            (Chord::Pair('z', 'c'), Action::Fold(FoldAction::Collapse)),
+        ]
+    ),
+    binding!(
+        "zA / zO / zC",
+        "toggle, expand, or collapse the selected fold recursively",
+        commands![
+            (
+                Chord::Pair('z', 'A'),
+                Action::Fold(FoldAction::ToggleRecursive)
+            ),
+            (
+                Chord::Pair('z', 'O'),
+                Action::Fold(FoldAction::ExpandRecursive)
+            ),
+            (
+                Chord::Pair('z', 'C'),
+                Action::Fold(FoldAction::CollapseRecursive)
+            ),
+        ]
+    ),
+    binding!(
+        "zR / zM",
+        "expand or collapse every fold",
+        commands![
+            (Chord::Pair('z', 'R'), Action::Fold(FoldAction::ExpandAll)),
+            (Chord::Pair('z', 'M'), Action::Fold(FoldAction::CollapseAll)),
+        ]
+    ),
+    binding!(
+        "zr / zm",
+        "reveal or hide one tree level",
+        commands![
+            (Chord::Pair('z', 'r'), Action::Fold(FoldAction::RevealLevel)),
+            (Chord::Pair('z', 'm'), Action::Fold(FoldAction::HideLevel)),
+        ]
     ),
 ];
 
@@ -377,7 +507,16 @@ const FLAT_NAVIGATION: &[Binding] = &[
             (Chord::Code(KeyCode::Up), Action::Move(-1)),
         ]
     ),
-    binding!("gg / G", "jump to first or last row", "gg/G", "edge", &[]),
+    binding!(
+        "gg / G",
+        "jump to first or last row",
+        "gg/G",
+        "edge",
+        commands![
+            (Chord::Pair('g', 'g'), Action::FirstRow),
+            (Chord::Char('G'), Action::LastRow),
+        ]
+    ),
     binding!(
         "PgUp / PgDn",
         "move selection by one visible pane",
@@ -413,11 +552,38 @@ pub fn global_bindings() -> &'static [Binding] {
 
 #[must_use]
 pub fn resolve(tab: Tab, key: KeyEvent) -> Option<Action> {
+    bindings(tab).find_map(|binding| binding.resolve(key))
+}
+
+fn begins_sequence(tab: Tab, prefix: char) -> bool {
+    bindings(tab).any(|binding| binding.begins_with(prefix))
+}
+
+fn resolve_pair(tab: Tab, prefix: char, suffix: char) -> Option<Action> {
+    bindings(tab).find_map(|binding| binding.resolve_pair(prefix, suffix))
+}
+
+fn bindings(tab: Tab) -> impl Iterator<Item = &'static Binding> {
     GLOBAL_BINDINGS
         .iter()
         .chain(tab.navigation())
         .chain(tab.bindings())
-        .find_map(|binding| binding.resolve(key))
+}
+
+fn plain_char(key: KeyEvent) -> Option<char> {
+    if key.modifiers.intersects(
+        KeyModifiers::CONTROL
+            | KeyModifiers::ALT
+            | KeyModifiers::SUPER
+            | KeyModifiers::HYPER
+            | KeyModifiers::META,
+    ) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(character) => Some(character),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -434,5 +600,26 @@ mod tests {
         assert_eq!(resolve(Tab::Shared, plain('m')), None);
         assert_eq!(resolve(Tab::Shared, plain('s')), Some(Action::CycleMetric));
         assert_eq!(resolve(Tab::Tmpfs, plain('s')), None);
+    }
+
+    #[test]
+    fn keymap_resolves_declared_sequences_only_in_their_panes() {
+        let plain = |character| KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
+        let mut keymap = Keymap::default();
+
+        assert_eq!(
+            keymap.resolve(Tab::Processes, plain('z')),
+            Resolution::Pending
+        );
+        assert_eq!(
+            keymap.resolve(Tab::Processes, plain('O')),
+            Resolution::Command(Action::Fold(FoldAction::ExpandRecursive))
+        );
+        assert_eq!(keymap.resolve(Tab::Shared, plain('g')), Resolution::Pending);
+        assert_eq!(
+            keymap.resolve(Tab::Shared, plain('g')),
+            Resolution::Command(Action::FirstRow)
+        );
+        assert_eq!(keymap.resolve(Tab::Shared, plain('z')), Resolution::Ignored);
     }
 }

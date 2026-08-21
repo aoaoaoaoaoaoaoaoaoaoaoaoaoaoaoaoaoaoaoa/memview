@@ -14,6 +14,7 @@ pub(super) fn build_process_rows(
             metric,
             scope,
         },
+        processes.meminfo.value("MemTotal").unwrap_or(Bytes::ZERO),
         scope,
         overrides,
         search,
@@ -28,10 +29,8 @@ pub(super) fn build_tmpfs_rows(
     search: Option<&Search>,
 ) -> (Vec<FlatTmpfsRow>, SearchSummary) {
     build_forest_rows(
-        &TmpfsForest {
-            tmpfs,
-            system_total,
-        },
+        &TmpfsForest { tmpfs },
+        system_total,
         scope,
         overrides,
         search,
@@ -98,12 +97,68 @@ trait Forest {
         fold: RowFold,
         search: SearchRole,
     ) -> Self::Row;
-    fn system_total(&self) -> Bytes;
     fn summary_label(&self) -> &'static str;
+}
+
+pub(super) enum FoldReach<Handle> {
+    Forest,
+    Subtree(Handle),
+}
+
+pub(super) fn overwrite_process_folds(
+    processes: &Processes,
+    metric: Metric,
+    scope: TreeScope,
+    reach: FoldReach<usize>,
+    overrides: &mut BTreeMap<ProcessKey, FoldOverride>,
+    override_: FoldOverride,
+) -> bool {
+    overwrite_branch_folds(
+        &ProcessForest {
+            processes,
+            metric,
+            scope,
+        },
+        reach,
+        overrides,
+        override_,
+    )
+}
+
+pub(super) fn overwrite_tmpfs_folds(
+    tmpfs: &Tmpfs,
+    reach: FoldReach<TmpfsTreeHandle>,
+    overrides: &mut BTreeMap<TmpfsStorageId, FoldOverride>,
+    override_: FoldOverride,
+) -> bool {
+    overwrite_branch_folds(&TmpfsForest { tmpfs }, reach, overrides, override_)
+}
+
+fn overwrite_branch_folds<F: Forest>(
+    forest: &F,
+    reach: FoldReach<F::Handle>,
+    overrides: &mut BTreeMap<F::Key, FoldOverride>,
+    override_: FoldOverride,
+) -> bool {
+    let mut changed = false;
+    let mut stack = match reach {
+        FoldReach::Forest => forest.roots(),
+        FoldReach::Subtree(root) => vec![root],
+    };
+    while let Some(handle) = stack.pop() {
+        let children = forest.children(handle);
+        if children.is_empty() {
+            continue;
+        }
+        changed |= overrides.insert(forest.key(handle), override_) != Some(override_);
+        stack.extend(children);
+    }
+    changed
 }
 
 fn build_forest_rows<F: Forest>(
     forest: &F,
+    system_total: Bytes,
     scope: TreeScope,
     overrides: &BTreeMap<F::Key, FoldOverride>,
     search: Option<&Search>,
@@ -135,7 +190,7 @@ fn build_forest_rows<F: Forest>(
     let policy = FoldPolicy {
         overrides,
         de_minimis: DeMinimis::from_largest_non_root(
-            forest.system_total(),
+            system_total,
             largest_non_root_subtree(forest),
         ),
     };
@@ -333,32 +388,23 @@ impl Forest for ProcessForest<'_> {
         }
     }
 
-    fn system_total(&self) -> Bytes {
-        self.processes
-            .meminfo
-            .value("MemTotal")
-            .unwrap_or(Bytes::ZERO)
-    }
-
     fn summary_label(&self) -> &'static str {
         self.metric.label()
     }
 }
 
-#[derive(Clone, Copy)]
-struct TmpfsHandle<'a> {
-    mount_index: usize,
-    node_id: TmpfsNodeId,
-    node: &'a TmpfsNode,
-}
-
 struct TmpfsForest<'a> {
     tmpfs: &'a Tmpfs,
-    system_total: Bytes,
 }
 
-impl<'a> Forest for TmpfsForest<'a> {
-    type Handle = TmpfsHandle<'a>;
+impl TmpfsForest<'_> {
+    fn node(&self, handle: TmpfsTreeHandle) -> &TmpfsNode {
+        self.tmpfs.mounts[handle.mount_index].node(handle.node_id)
+    }
+}
+
+impl Forest for TmpfsForest<'_> {
+    type Handle = TmpfsTreeHandle;
     type Key = TmpfsStorageId;
     type Row = FlatTmpfsRow;
 
@@ -367,23 +413,20 @@ impl<'a> Forest for TmpfsForest<'a> {
             .mounts
             .iter()
             .enumerate()
-            .map(|(mount_index, mount)| TmpfsHandle {
+            .map(|(mount_index, mount)| TmpfsTreeHandle {
                 mount_index,
                 node_id: mount.root,
-                node: mount.root(),
             })
             .collect()
     }
 
     fn children(&self, handle: Self::Handle) -> Vec<Self::Handle> {
-        handle
-            .node
+        self.node(handle)
             .children
             .iter()
-            .map(|node_id| TmpfsHandle {
+            .map(|node_id| TmpfsTreeHandle {
                 mount_index: handle.mount_index,
                 node_id: *node_id,
-                node: self.tmpfs.mounts[handle.mount_index].node(*node_id),
             })
             .collect()
     }
@@ -404,20 +447,20 @@ impl<'a> Forest for TmpfsForest<'a> {
     }
 
     fn key(&self, handle: Self::Handle) -> Self::Key {
-        handle.node.storage
+        self.node(handle).storage
     }
 
     fn direct_value(&self, handle: Self::Handle) -> Bytes {
-        handle.node.allocated
+        self.node(handle).allocated
     }
 
     fn total_value(&self, handle: Self::Handle) -> Bytes {
-        handle.node.allocated
+        self.node(handle).allocated
     }
 
     fn matches(&self, search: &Search, handle: Self::Handle) -> bool {
-        search.matches(handle.node.kind.label())
-            || search.matches(handle.node.path.to_string_lossy().as_ref())
+        let node = self.node(handle);
+        search.matches(node.kind.label()) || search.matches(node.path.to_string_lossy().as_ref())
     }
 
     fn row(
@@ -430,15 +473,11 @@ impl<'a> Forest for TmpfsForest<'a> {
         FlatTmpfsRow {
             mount_index: handle.mount_index,
             node_id: handle.node_id,
-            key: handle.node.storage,
+            key: self.node(handle).storage,
             depth,
             fold,
             search,
         }
-    }
-
-    fn system_total(&self) -> Bytes {
-        self.system_total
     }
 
     fn summary_label(&self) -> &'static str {

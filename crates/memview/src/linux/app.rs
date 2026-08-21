@@ -3,7 +3,7 @@ use super::model::{
     ProcessNode, Processes, Shared, SharedObject, Tmpfs, TmpfsMount, TmpfsNode, TmpfsNodeId,
     TmpfsStorageId,
 };
-use super::nav::{self, Action};
+use super::nav::{self, Action, FoldAction};
 pub use super::nav::{Binding, BindingSections, Tab};
 use super::probe;
 use super::search::{Search, SearchDraft, SearchRole, SearchSummary};
@@ -11,7 +11,7 @@ use color_eyre::eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use rustix::fd::OwnedFd;
 use rustix::process::{Pid as KernelPid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
 mod ledgers;
@@ -20,7 +20,10 @@ mod rows;
 mod worker;
 use ledgers::Ledgers;
 use mappings::MappingLedgers;
-use rows::{build_process_rows, build_shared_rows, build_tmpfs_rows};
+use rows::{
+    FoldReach, build_process_rows, build_shared_rows, build_tmpfs_rows, overwrite_process_folds,
+    overwrite_tmpfs_folds,
+};
 #[cfg(test)]
 pub use worker::ProcessRequest;
 pub use worker::{WorkerEvent, WorkerPort, spawn_worker};
@@ -174,6 +177,31 @@ impl IdentifiedRow for FlatSharedRow {
     }
 }
 
+trait FoldRow: IdentifiedRow {
+    fn depth(&self) -> usize;
+    fn fold(&self) -> RowFold;
+}
+
+impl FoldRow for FlatProcessRow {
+    fn depth(&self) -> usize {
+        self.depth
+    }
+
+    fn fold(&self) -> RowFold {
+        self.fold
+    }
+}
+
+impl FoldRow for FlatTmpfsRow {
+    fn depth(&self) -> usize {
+        self.depth
+    }
+
+    fn fold(&self) -> RowFold {
+        self.fold
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PaneRows<Row: IdentifiedRow> {
     rows: Vec<Row>,
@@ -211,6 +239,26 @@ impl<Row: IdentifiedRow> PaneRows<Row> {
 
     fn install(&mut self, rows: Vec<Row>) {
         self.install_prefer(rows, self.selected_key());
+    }
+
+    fn install_tree(&mut self, rows: Vec<Row>)
+    where
+        Row: FoldRow,
+    {
+        let mut lineage = Vec::new();
+        if let Some(selected) = self.selected {
+            let mut shallower_than = usize::MAX;
+            for row in self.rows[..=selected.get()].iter().rev() {
+                if row.depth() < shallower_than {
+                    shallower_than = row.depth();
+                    lineage.push(row.key().clone());
+                }
+            }
+        }
+        let preferred = lineage
+            .into_iter()
+            .find(|key| rows.iter().any(|row| row.key() == key));
+        self.install_prefer(rows, preferred);
     }
 
     fn install_pinned_to_top(&mut self, rows: Vec<Row>) {
@@ -373,9 +421,65 @@ impl FoldMutation {
     }
 }
 
-enum FoldTarget {
-    Process(ProcessKey),
-    Tmpfs(TmpfsStorageId),
+#[derive(Clone, Copy)]
+struct TmpfsTreeHandle {
+    mount_index: usize,
+    node_id: TmpfsNodeId,
+}
+
+fn reveal_fold_level<Row: FoldRow>(
+    rows: &PaneRows<Row>,
+    overrides: &mut BTreeMap<Row::Key, FoldOverride>,
+) -> bool {
+    let keys = rows
+        .rows()
+        .iter()
+        .filter(|row| row.fold() == RowFold::Collapsed)
+        .map(|row| row.key().clone())
+        .collect::<Vec<_>>();
+    overwrite_folds(keys, overrides, FoldOverride::Expanded)
+}
+
+fn hide_fold_level<Row: FoldRow>(
+    rows: &PaneRows<Row>,
+    overrides: &mut BTreeMap<Row::Key, FoldOverride>,
+) -> bool {
+    let Some(depth) = rows
+        .rows()
+        .iter()
+        .filter(|row| row.fold() == RowFold::Expanded)
+        .map(FoldRow::depth)
+        .max()
+    else {
+        return false;
+    };
+    let keys = rows
+        .rows()
+        .iter()
+        .filter(|row| row.depth() == depth && row.fold() == RowFold::Expanded)
+        .map(|row| row.key().clone())
+        .collect::<Vec<_>>();
+    overwrite_folds(keys, overrides, FoldOverride::Collapsed)
+}
+
+fn overwrite_folds<Key: Ord>(
+    keys: impl IntoIterator<Item = Key>,
+    overrides: &mut BTreeMap<Key, FoldOverride>,
+    override_: FoldOverride,
+) -> bool {
+    let mut changed = false;
+    for key in keys {
+        changed |= overrides.insert(key, override_) != Some(override_);
+    }
+    changed
+}
+
+fn retain_live_folds<Key: Ord>(
+    overrides: &mut BTreeMap<Key, FoldOverride>,
+    live: impl IntoIterator<Item = Key>,
+) {
+    let live = live.into_iter().collect::<BTreeSet<_>>();
+    overrides.retain(|key, _| live.contains(key));
 }
 
 #[derive(Clone, Copy)]
@@ -426,42 +530,6 @@ impl<Key: Ord> FoldPolicy<'_, Key> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum KeySequence {
-    #[default]
-    Root,
-    G,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SequenceResolution {
-    Unmatched(KeyEvent),
-    Pending,
-    Cancelled,
-    Command(Action),
-}
-
-impl KeySequence {
-    fn resolve(&mut self, key: KeyEvent) -> SequenceResolution {
-        match (*self, plain_char(key)) {
-            (Self::Root, Some('g')) => {
-                *self = Self::G;
-                SequenceResolution::Pending
-            }
-            (Self::Root, Some('G')) => SequenceResolution::Command(Action::LastRow),
-            (Self::Root, _) => SequenceResolution::Unmatched(key),
-            (Self::G, Some('g')) => {
-                *self = Self::Root;
-                SequenceResolution::Command(Action::FirstRow)
-            }
-            (Self::G, _) => {
-                *self = Self::Root;
-                SequenceResolution::Cancelled
-            }
-        }
-    }
-}
-
 fn plain_char(key: KeyEvent) -> Option<char> {
     if key.modifiers.intersects(
         KeyModifiers::CONTROL
@@ -502,7 +570,7 @@ pub struct App {
     shared_rows: PaneRows<FlatSharedRow>,
     projection_debt: ProjectionDebt,
     page_rows: PageRows,
-    key_sequence: KeySequence,
+    keymap: nav::Keymap,
 }
 
 enum Modal {
@@ -598,7 +666,7 @@ impl App {
             shared_rows: PaneRows::default(),
             projection_debt: ProjectionDebt::default(),
             page_rows: PageRows::default(),
-            key_sequence: KeySequence::default(),
+            keymap: nav::Keymap::default(),
         }
     }
 
@@ -663,7 +731,18 @@ impl App {
         match result {
             Ok(ledger) => {
                 self.last_error = None;
-                self.ledgers.tmpfs = Some(*ledger);
+                let ledger = *ledger;
+                retain_live_folds(
+                    &mut self.tmpfs_folds,
+                    ledger
+                        .value
+                        .mounts
+                        .iter()
+                        .flat_map(|mount| mount.nodes.iter())
+                        .filter(|node| !node.children.is_empty())
+                        .map(|node| node.storage),
+                );
+                self.ledgers.tmpfs = Some(ledger);
                 self.projection_debt.strike(Projection::Tmpfs);
                 self.project_current_pane();
             }
@@ -716,6 +795,16 @@ impl App {
     }
 
     fn install_processes(&mut self, ledger: Ledger<Processes>) {
+        retain_live_folds(
+            &mut self.process_folds,
+            ledger
+                .value
+                .tree
+                .nodes
+                .iter()
+                .filter(|node| !node.children.is_empty())
+                .map(|node| node.key()),
+        );
         self.ledgers.install_processes(ledger);
         self.projection_debt.strike(Projection::Processes);
         self.project_current_pane();
@@ -926,7 +1015,7 @@ impl App {
             },
         );
         self.process_search = summary;
-        self.process_rows.install(rows);
+        self.process_rows.install_tree(rows);
         self.projection_debt.settle(Projection::Processes);
     }
 
@@ -949,7 +1038,7 @@ impl App {
         );
         self.tmpfs_search = summary;
         if self.tmpfs_selection.preserves_anchor() {
-            self.tmpfs_rows.install(rows);
+            self.tmpfs_rows.install_tree(rows);
         } else {
             self.tmpfs_rows.install_pinned_to_top(rows);
         }
@@ -1136,15 +1225,10 @@ impl App {
             return self.handle_help_key(key);
         }
 
-        match self.key_sequence.resolve(key) {
-            SequenceResolution::Unmatched(key) => self.handle_single_key(key, commands),
-            SequenceResolution::Pending | SequenceResolution::Cancelled => false,
-            SequenceResolution::Command(action) => self.execute(action, commands),
+        match self.keymap.resolve(self.tab, key) {
+            nav::Resolution::Ignored | nav::Resolution::Pending => false,
+            nav::Resolution::Command(action) => self.execute(action, commands),
         }
-    }
-
-    fn handle_single_key(&mut self, key: KeyEvent, commands: &WorkerPort) -> bool {
-        nav::resolve(self.tab, key).is_some_and(|action| self.execute(action, commands))
     }
 
     fn execute(&mut self, action: Action, commands: &WorkerPort) -> bool {
@@ -1180,9 +1264,10 @@ impl App {
             Action::PageUp => {
                 let _ = self.page_selection_and_request_mappings(PageDirection::Up, commands);
             }
-            Action::Collapse => self.mutate_current_fold(FoldMutation::Collapse),
-            Action::Expand => self.mutate_current_fold(FoldMutation::Expand),
-            Action::Toggle => self.mutate_current_fold(FoldMutation::Toggle),
+            Action::Fold(action) => {
+                let changed = self.mutate_current_fold(action);
+                let _ = self.request_selected_process_mappings_after(changed, commands);
+            }
             Action::FirstRow => {
                 let _ = self.select_edge_and_request_mappings(RowEdge::First, commands);
             }
@@ -1197,7 +1282,7 @@ impl App {
         if self.modal.is_some() {
             return false;
         }
-        self.key_sequence = KeySequence::Root;
+        self.keymap.cancel();
 
         match mouse.kind {
             MouseEventKind::ScrollDown => self.move_selection_and_request_mappings(1, commands),
@@ -1262,7 +1347,7 @@ impl App {
     }
 
     fn open_search(&mut self) {
-        self.key_sequence = KeySequence::Root;
+        self.keymap.cancel();
         self.modal = Some(Modal::Search(SearchDraft::new(self.search.as_ref())));
     }
 
@@ -1394,7 +1479,10 @@ impl App {
         match self.tab {
             Tab::Overview => false,
             Tab::Processes => self.process_rows.move_by(delta),
-            Tab::Tmpfs => self.tmpfs_rows.move_by(delta),
+            Tab::Tmpfs => {
+                self.seize_tmpfs_selection();
+                self.tmpfs_rows.move_by(delta)
+            }
             Tab::Shared => self.shared_rows.move_by(delta),
         }
     }
@@ -1445,37 +1533,146 @@ impl App {
         match self.tab {
             Tab::Overview => false,
             Tab::Processes => self.process_rows.select_edge(edge),
-            Tab::Tmpfs => self.tmpfs_rows.select_edge(edge),
+            Tab::Tmpfs => {
+                self.seize_tmpfs_selection();
+                self.tmpfs_rows.select_edge(edge)
+            }
             Tab::Shared => self.shared_rows.select_edge(edge),
         }
     }
 
-    fn mutate_current_fold(&mut self, mutation: FoldMutation) {
-        let target = match self.tab {
-            Tab::Processes => self
-                .process_rows
-                .selected()
-                .map(|row| (FoldTarget::Process(row.key), row.fold)),
-            Tab::Tmpfs => self
-                .tmpfs_rows
-                .selected()
-                .map(|row| (FoldTarget::Tmpfs(row.key), row.fold)),
-            Tab::Overview | Tab::Shared => None,
+    fn mutate_current_fold(&mut self, action: FoldAction) -> bool {
+        if self.search.is_some() {
+            return false;
+        }
+        let selected_process = self.process_rows.selected_key();
+        let mutated = match action {
+            FoldAction::Collapse => self.mutate_selected_fold(FoldMutation::Collapse),
+            FoldAction::Expand => self.mutate_selected_fold(FoldMutation::Expand),
+            FoldAction::Toggle => self.mutate_selected_fold(FoldMutation::Toggle),
+            FoldAction::CollapseRecursive => self.mutate_selected_subtree(FoldMutation::Collapse),
+            FoldAction::ExpandRecursive => self.mutate_selected_subtree(FoldMutation::Expand),
+            FoldAction::ToggleRecursive => self.mutate_selected_subtree(FoldMutation::Toggle),
+            FoldAction::CollapseAll => self.overwrite_current_forest(FoldOverride::Collapsed),
+            FoldAction::ExpandAll => self.overwrite_current_forest(FoldOverride::Expanded),
+            FoldAction::RevealLevel => self.reveal_current_level(),
+            FoldAction::HideLevel => self.hide_current_level(),
         };
-        let Some((target, override_)) = target
-            .and_then(|(target, fold)| mutation.apply(fold).map(|override_| (target, override_)))
-        else {
-            return;
-        };
-        match target {
-            FoldTarget::Process(key) => {
-                let _ = self.process_folds.insert(key, override_);
-                self.rebuild_process_rows();
+        if !mutated {
+            return false;
+        }
+        match self.tab {
+            Tab::Processes => self.rebuild_process_rows(),
+            Tab::Tmpfs => self.rebuild_tmpfs_rows(),
+            Tab::Overview | Tab::Shared => return false,
+        }
+        self.tab == Tab::Processes && selected_process != self.process_rows.selected_key()
+    }
+
+    fn mutate_selected_fold(&mut self, mutation: FoldMutation) -> bool {
+        match self.tab {
+            Tab::Processes => self.process_rows.selected().is_some_and(|row| {
+                mutation.apply(row.fold).is_some_and(|override_| {
+                    self.process_folds.insert(row.key, override_) != Some(override_)
+                })
+            }),
+            Tab::Tmpfs => self.tmpfs_rows.selected().is_some_and(|row| {
+                mutation.apply(row.fold).is_some_and(|override_| {
+                    self.tmpfs_folds.insert(row.key, override_) != Some(override_)
+                })
+            }),
+            Tab::Overview | Tab::Shared => false,
+        }
+    }
+
+    fn mutate_selected_subtree(&mut self, mutation: FoldMutation) -> bool {
+        match self.tab {
+            Tab::Processes => {
+                let Some((root, override_)) = self.process_rows.selected().and_then(|row| {
+                    mutation
+                        .apply(row.fold)
+                        .map(|override_| (row.index, override_))
+                }) else {
+                    return false;
+                };
+                let Some(processes) = self.ledgers.process_data() else {
+                    return false;
+                };
+                overwrite_process_folds(
+                    processes,
+                    self.metric,
+                    self.tree_scope,
+                    FoldReach::Subtree(root),
+                    &mut self.process_folds,
+                    override_,
+                )
             }
-            FoldTarget::Tmpfs(path) => {
-                let _ = self.tmpfs_folds.insert(path, override_);
-                self.rebuild_tmpfs_rows();
+            Tab::Tmpfs => {
+                let Some((root, override_)) = self.tmpfs_rows.selected().and_then(|row| {
+                    mutation.apply(row.fold).map(|override_| {
+                        (
+                            TmpfsTreeHandle {
+                                mount_index: row.mount_index,
+                                node_id: row.node_id,
+                            },
+                            override_,
+                        )
+                    })
+                }) else {
+                    return false;
+                };
+                let Some(tmpfs) = self.ledgers.tmpfs_data() else {
+                    return false;
+                };
+                overwrite_tmpfs_folds(
+                    tmpfs,
+                    FoldReach::Subtree(root),
+                    &mut self.tmpfs_folds,
+                    override_,
+                )
             }
+            Tab::Overview | Tab::Shared => false,
+        }
+    }
+
+    fn overwrite_current_forest(&mut self, override_: FoldOverride) -> bool {
+        match self.tab {
+            Tab::Processes => {
+                let Some(processes) = self.ledgers.process_data() else {
+                    return false;
+                };
+                overwrite_process_folds(
+                    processes,
+                    self.metric,
+                    self.tree_scope,
+                    FoldReach::Forest,
+                    &mut self.process_folds,
+                    override_,
+                )
+            }
+            Tab::Tmpfs => {
+                let Some(tmpfs) = self.ledgers.tmpfs_data() else {
+                    return false;
+                };
+                overwrite_tmpfs_folds(tmpfs, FoldReach::Forest, &mut self.tmpfs_folds, override_)
+            }
+            Tab::Overview | Tab::Shared => false,
+        }
+    }
+
+    fn reveal_current_level(&mut self) -> bool {
+        match self.tab {
+            Tab::Processes => reveal_fold_level(&self.process_rows, &mut self.process_folds),
+            Tab::Tmpfs => reveal_fold_level(&self.tmpfs_rows, &mut self.tmpfs_folds),
+            Tab::Overview | Tab::Shared => false,
+        }
+    }
+
+    fn hide_current_level(&mut self) -> bool {
+        match self.tab {
+            Tab::Processes => hide_fold_level(&self.process_rows, &mut self.process_folds),
+            Tab::Tmpfs => hide_fold_level(&self.tmpfs_rows, &mut self.tmpfs_folds),
+            Tab::Overview | Tab::Shared => false,
         }
     }
 

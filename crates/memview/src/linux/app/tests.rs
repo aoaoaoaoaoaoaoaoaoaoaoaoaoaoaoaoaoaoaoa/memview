@@ -248,6 +248,87 @@ fn fold_policy_respects_roots_leaves_and_manual_overrides() {
 }
 
 #[test]
+fn vim_fold_grammar_composes_subtree_and_forest_depth_operations() {
+    let (processes, _requests) = mpsc::channel();
+    let commands = WorkerPort::process_harness(processes);
+    let mut app = App::new(UiState::default());
+    app.tab = Tab::Tmpfs;
+    app.ledgers.tmpfs = Some(tmpfs_ledger(vec![tmpfs_tree(
+        "/mnt",
+        Bytes(100),
+        vec![
+            tmpfs_dir(
+                "/mnt/a",
+                Bytes(60),
+                vec![tmpfs_dir(
+                    "/mnt/a/deep",
+                    Bytes(40),
+                    vec![tmpfs_dir("/mnt/a/deep/leaf", Bytes(5), Vec::new())],
+                )],
+            ),
+            tmpfs_dir("/mnt/b", Bytes(10), Vec::new()),
+        ],
+    )]));
+    app.rebuild_tmpfs_rows();
+
+    let press = |app: &mut App, keys: &str| {
+        for key in keys.chars() {
+            let _ = app.handle_key(
+                KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+                &commands,
+            );
+        }
+    };
+    for _ in 0..3 {
+        press(&mut app, "j");
+    }
+    press(&mut app, "zM");
+    assert_eq!(
+        tmpfs_row_path(
+            &app,
+            app.tmpfs_rows
+                .selected()
+                .expect("collapsed forest has a root"),
+        ),
+        Path::new("/mnt")
+    );
+    assert_eq!(app.tmpfs_rows()[0].fold, RowFold::Collapsed);
+
+    press(&mut app, "zr");
+    assert_eq!(app.tmpfs_rows()[1].fold, RowFold::Collapsed);
+    press(&mut app, "zr");
+    assert_eq!(app.tmpfs_rows()[2].fold, RowFold::Collapsed);
+    press(&mut app, "zr");
+    assert_eq!(app.tmpfs_rows().len(), 5);
+    press(&mut app, "zm");
+    assert_eq!(app.tmpfs_rows()[2].fold, RowFold::Collapsed);
+
+    press(&mut app, "zRjzC");
+    assert_eq!(
+        app.tmpfs_rows()
+            .iter()
+            .map(|row| tmpfs_row_path(&app, row))
+            .collect::<Vec<_>>(),
+        vec![Path::new("/mnt"), Path::new("/mnt/a"), Path::new("/mnt/b")]
+    );
+    press(&mut app, "zo");
+    assert_eq!(
+        app.tmpfs_rows()
+            .iter()
+            .map(|row| (tmpfs_row_path(&app, row), row.fold))
+            .collect::<Vec<_>>(),
+        vec![
+            (Path::new("/mnt"), RowFold::Expanded),
+            (Path::new("/mnt/a"), RowFold::Expanded),
+            (Path::new("/mnt/a/deep"), RowFold::Collapsed),
+            (Path::new("/mnt/b"), RowFold::Leaf),
+        ]
+    );
+    press(&mut app, "zO");
+    assert_eq!(app.tmpfs_rows().len(), 5);
+}
+
+#[test]
 fn process_search_matches_cwd() {
     let mut app = App::new(UiState::default());
     app.ledgers.processes = Some(process_ledger(vec![process_node(
