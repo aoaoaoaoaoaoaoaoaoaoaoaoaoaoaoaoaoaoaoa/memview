@@ -17,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 WORKSPACE_MANIFEST = ROOT / "Cargo.toml"
 CRATES_IO_API = "https://crates.io/api/v1/crates/memview"
-AUTHORITATIVE_REMOTES = ("swarm", "github")
+AUTHORITATIVE_REMOTES = ("github",)
 
 
 @dataclass(frozen=True, order=True, slots=True)
@@ -248,7 +248,7 @@ def plan(explicit: str | None) -> None:
     version = planned_version(explicit)
     availability = "published" if crate_version_published(version) else "available"
     print(f"[publish] plan: memview {version} ({availability})", flush=True)
-    print("[publish] commit/tag -> swarm -> github -> crates.io -> local install", flush=True)
+    print("[publish] commit/tag -> github -> crates.io -> local install", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
