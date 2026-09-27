@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Before meaningful Rust edits, read the [Rust Style Doctrine](/home/main/programming/projects/rust_starter/docs/rust-style-doctrine.md).
+Before meaningful Rust edits, load `$style-doctrine`.
 It intentionally rejects several pieces of conventional Rust advice; preserve
 those inversions instead of translating them back into generic approachable
 code.
