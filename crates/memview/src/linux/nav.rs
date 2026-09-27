@@ -329,7 +329,7 @@ const GLOBAL_BINDINGS: &[Binding] = &[
 const OVERVIEW_BINDINGS: &[Binding] = &[
     binding!(
         "r",
-        "refresh kernel counters, tmpfs mounts, and SysV shm",
+        "refresh kernel counters and SysV shm",
         "r",
         "refresh",
         commands![(Chord::Char('r'), Action::Refresh)]

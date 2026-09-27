@@ -12,7 +12,7 @@ use color_eyre::eyre::{Result, ensure};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
-    KeyEventKind,
+    KeyEventKind, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -33,6 +33,7 @@ const ANIMATED_REDRAW: Duration = Duration::from_millis(250);
 #[derive(Debug, Parser)]
 #[command(author, version, about = "ncdu-like RAM accounting for Linux /proc")]
 struct Cli {
+    /// Minimum automatic refresh delay; expensive scans extend it to limit work.
     #[arg(long, default_value_t = 5000)]
     refresh_ms: u64,
 }
@@ -64,6 +65,7 @@ pub fn run() -> MainResult {
         if let Some(signal) = termination.pending() {
             break Some(signal);
         }
+        dirty |= app.pause_if_idle(&commands);
         while let Ok(event) = events.try_recv() {
             app.apply_worker_event(event, &commands);
             dirty = true;
@@ -88,6 +90,7 @@ pub fn run() -> MainResult {
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
+                    app.note_interaction(&commands);
                     let quit = app.handle_key(key, &commands);
                     if let Some(warning) = state_store.sync(app.ui_state()) {
                         app.last_error = Some(warning);
@@ -98,6 +101,13 @@ pub fn run() -> MainResult {
                     dirty = true;
                 }
                 Event::Mouse(mouse) => {
+                    if matches!(
+                        mouse.kind,
+                        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                    ) {
+                        app.note_interaction(&commands);
+                        dirty = true;
+                    }
                     if app.handle_mouse(mouse, &commands) {
                         dirty = true;
                     }
@@ -112,6 +122,9 @@ pub fn run() -> MainResult {
                 }
                 Event::FocusLost => {
                     app.set_focused(false, &commands);
+                    // The terminal may remain visible after losing focus. Paint
+                    // the pause reason once, then leave its contents untouched.
+                    terminal.draw(|frame| ui::render(frame, &app))?;
                     dirty = false;
                 }
                 Event::Paste(_) => {}

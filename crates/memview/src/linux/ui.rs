@@ -98,6 +98,17 @@ fn header(app: &App) -> Paragraph<'static> {
 
 fn footer(app: &App) -> Paragraph<'_> {
     let mut spans = Vec::new();
+    if app.tab.drives_process_scans()
+        && let Some(reason) = app.refresh_pause()
+    {
+        spans.push(Span::styled(
+            match reason {
+                super::app::RefreshPause::Inactive => "PAUSED · idle · press a key to resume  ",
+                super::app::RefreshPause::Unfocused => "PAUSED · terminal unfocused  ",
+            },
+            Style::default().fg(GOLD),
+        ));
+    }
     if let Some(pattern) = app.search_pattern() {
         spans.push(Span::styled(
             format!(" FILTER /{pattern}/ "),

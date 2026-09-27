@@ -7,6 +7,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const MIN_WORKER_REFRESH: Duration = Duration::from_secs(1);
+// Automatic scans target at most 1% duty cycle. Wall time conservatively
+// includes procfs stalls; explicit user requests bypass the cooldown.
+const SCAN_COOLDOWN_RATIO: u32 = 99;
 
 #[derive(Clone, Debug)]
 enum InventoryRequest {
@@ -171,10 +174,7 @@ struct InventoryDemand {
 impl InventoryDemand {
     fn absorb(&mut self, request: InventoryRequest) {
         match request {
-            InventoryRequest::Refresh => {
-                self.inventory.raise();
-                self.tmpfs.raise();
-            }
+            InventoryRequest::Refresh => self.inventory.raise(),
             InventoryRequest::RefreshTmpfs => self.tmpfs.raise(),
             InventoryRequest::Shutdown => self.life = WorkerLife::Shutdown,
         }
@@ -362,14 +362,15 @@ fn spawn_process_worker(
         let mut deadline = None;
 
         while let Some(job) = next_process_job(&mailbox, deadline) {
+            let started = Instant::now();
             if !publish_process_job(&event_tx, job) {
                 break;
             }
-            let (demand, _) = &*mailbox;
-            deadline = lock(demand)
-                .cadence
-                .active()
-                .then(|| Instant::now() + refresh_every);
+            let cooldown = started.elapsed().saturating_mul(SCAN_COOLDOWN_RATIO);
+            let now = Instant::now();
+            // Follow-up mappings must not replace a costly summary's cooldown
+            // with their own, usually much shorter interval.
+            deadline = Some((deadline.unwrap_or(now).max(now) + cooldown).max(now + refresh_every));
         }
     });
 }

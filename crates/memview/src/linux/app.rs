@@ -29,7 +29,14 @@ pub use worker::ProcessRequest;
 pub use worker::{WorkerEvent, WorkerPort, spawn_worker};
 
 const KILL_ARMING_DELAY: Duration = Duration::from_secs(2);
+const IDLE_REFRESH_PAUSE: Duration = Duration::from_secs(30);
 const TERMINAL_FRAME_ROWS: u16 = 9;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RefreshPause {
+    Inactive,
+    Unfocused,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TreeScope {
@@ -552,6 +559,7 @@ pub struct App {
     pub metric: Metric,
     pub tree_scope: TreeScope,
     focused: bool,
+    refresh_deadline: Option<Instant>,
     modal: Option<Modal>,
     ledgers: Ledgers,
     pub last_error: Option<String>,
@@ -648,6 +656,7 @@ impl App {
             metric: state.metric,
             tree_scope: state.tree_scope,
             focused: true,
+            refresh_deadline: Some(Instant::now() + IDLE_REFRESH_PAUSE),
             modal: None,
             ledgers: Ledgers::default(),
             last_error: None,
@@ -698,7 +707,41 @@ impl App {
             return;
         }
         self.focused = focused;
+        if focused {
+            self.refresh_deadline = Some(Instant::now() + IDLE_REFRESH_PAUSE);
+        }
         self.sync_process_scanning(commands);
+    }
+
+    pub fn note_interaction(&mut self, commands: &WorkerPort) {
+        let paused = self.refresh_deadline.is_none();
+        self.refresh_deadline = Some(Instant::now() + IDLE_REFRESH_PAUSE);
+        if paused {
+            self.sync_process_scanning(commands);
+        }
+    }
+
+    pub fn pause_if_idle(&mut self, commands: &WorkerPort) -> bool {
+        if self
+            .refresh_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.refresh_deadline = None;
+            self.sync_process_scanning(commands);
+            return true;
+        }
+        false
+    }
+
+    #[must_use]
+    pub fn refresh_pause(&self) -> Option<RefreshPause> {
+        if !self.focused {
+            Some(RefreshPause::Unfocused)
+        } else if self.refresh_deadline.is_none() {
+            Some(RefreshPause::Inactive)
+        } else {
+            None
+        }
     }
 
     pub fn apply_worker_event(&mut self, event: WorkerEvent, commands: &WorkerPort) {
@@ -1306,7 +1349,9 @@ impl App {
     }
 
     fn sync_process_scanning(&self, commands: &WorkerPort) {
-        commands.set_process_scanning(self.focused && self.tab.drives_process_scans());
+        commands.set_process_scanning(
+            self.refresh_pause().is_none() && self.tab.drives_process_scans(),
+        );
     }
 
     fn request_current_pane(&mut self, commands: &WorkerPort) {
@@ -1322,7 +1367,7 @@ impl App {
     }
 
     fn request_selected_process_mappings(&mut self, commands: &WorkerPort) {
-        if self.tab != Tab::Processes {
+        if self.tab != Tab::Processes || self.refresh_pause().is_some() {
             return;
         }
         let Some(process) = self.selected_process() else {

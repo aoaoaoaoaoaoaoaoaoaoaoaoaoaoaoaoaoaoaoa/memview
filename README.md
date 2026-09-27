@@ -19,9 +19,15 @@ cargo install memview --locked
 memview
 ```
 
-`memview` requires interactive stdin and stdout. Use `--refresh-ms N` to change the process refresh
-period from its 5000 ms default. Press `?` for the complete, scrollable key catalogue and accounting
-notes.
+`memview` requires interactive stdin and stdout. Process updates pause after 30 seconds without
+keyboard or scroll input, or immediately when the terminal reports losing focus. A `PAUSED`
+indicator shows why. Terminal focus is a conservative proxy for visibility: a visible but unfocused
+window also pauses; terminals without focus reporting still pause on inactivity. Interaction resumes updates;
+`r` requests an immediate refresh. Automatic scans wait at least 99 times the preceding scan's
+elapsed time, targeting at most a 1% scan duty cycle. `--refresh-ms N` sets the minimum delay
+(default 5000 ms), not a fixed sampling period. In-flight scans finish normally. Overview does not
+walk tmpfs; that work runs only in the tmpfs pane. Press `?` for the complete, scrollable key
+catalogue and accounting notes.
 
 The only mutating action sends SIGTERM after a named, delayed confirmation through a pidfd. Reading
 other users' procfs data and NVIDIA shrinker counters depends on host permissions; do not run the

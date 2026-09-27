@@ -209,7 +209,7 @@ fn de_minimis_chooses_lower_threshold() {
 }
 
 #[test]
-fn process_scanning_tracks_focus_and_active_tab() {
+fn process_scanning_tracks_focus_activity_and_active_tab() {
     let (commands, events) = mpsc::channel();
     let commands = WorkerPort::process_harness(commands);
     let mut app = App::new(UiState::default());
@@ -228,6 +228,26 @@ fn process_scanning_tracks_focus_and_active_tab() {
     app.set_focused(false, &commands);
     assert!(!next_process_scan_switch(&events));
     assert!(!app.needs_periodic_redraw());
+
+    // Focus reports and input are independent: input must not rearm a hidden
+    // pane, and a focused terminal without focus reporting must still go idle.
+    app.refresh_deadline = Some(Instant::now());
+    assert!(app.pause_if_idle(&commands));
+    assert!(!next_process_scan_switch(&events));
+    assert!(!app.pause_if_idle(&commands));
+    app.note_interaction(&commands);
+    assert!(!next_process_scan_switch(&events));
+    app.set_focused(true, &commands);
+    assert!(next_process_scan_switch(&events));
+    app.refresh_deadline = Some(Instant::now());
+    assert!(app.pause_if_idle(&commands));
+    assert!(!next_process_scan_switch(&events));
+    app.note_interaction(&commands);
+    assert!(next_process_scan_switch(&events));
+    app.select_tab(Tab::Overview, &commands);
+    assert!(!next_process_scan_switch(&events));
+    app.note_interaction(&commands);
+    assert!(events.try_recv().is_err());
 }
 
 #[test]
