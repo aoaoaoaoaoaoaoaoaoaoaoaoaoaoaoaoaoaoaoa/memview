@@ -17,12 +17,10 @@ impl Search {
             .map_err(|error| error.to_string())
     }
 
-    #[must_use]
     pub fn pattern(&self) -> &str {
         &self.pattern
     }
 
-    #[must_use]
     pub fn matches(&self, value: &str) -> bool {
         self.regex.is_match(value)
     }
@@ -35,7 +33,6 @@ pub struct SearchDraft {
 }
 
 impl SearchDraft {
-    #[must_use]
     pub fn new(active: Option<&Search>) -> Self {
         Self {
             input: active.map_or_else(String::new, |search| search.pattern().to_string()),
@@ -43,17 +40,14 @@ impl SearchDraft {
         }
     }
 
-    #[must_use]
     pub fn from_input(input: String) -> Self {
         Self { input, error: None }
     }
 
-    #[must_use]
     pub fn input(&self) -> &str {
         &self.input
     }
 
-    #[must_use]
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
@@ -64,7 +58,7 @@ impl SearchDraft {
     }
 
     pub fn backspace(&mut self) {
-        let _ = self.input.pop();
+        self.input.pop();
         self.error = None;
     }
 
@@ -77,7 +71,6 @@ impl SearchDraft {
         self.error = Some(error);
     }
 
-    #[must_use]
     pub fn into_input(self) -> String {
         self.input
     }
@@ -92,7 +85,6 @@ pub enum SearchRole {
 }
 
 impl SearchRole {
-    #[must_use]
     pub fn is_context(self) -> bool {
         self == Self::Context
     }
@@ -106,7 +98,6 @@ pub struct SearchSummary {
 }
 
 impl SearchSummary {
-    #[must_use]
     pub const fn new(lens: &'static str) -> Self {
         Self {
             matches: 0,

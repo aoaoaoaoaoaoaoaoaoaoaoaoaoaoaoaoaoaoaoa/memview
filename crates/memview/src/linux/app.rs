@@ -65,7 +65,6 @@ impl TreeScope {
     #[cfg(test)]
     pub const ALL: [Self; 2] = [Self::SelfOnly, Self::SelfAndChildren];
 
-    #[must_use]
     pub fn next(self) -> Self {
         match self {
             Self::SelfOnly => Self::SelfAndChildren,
@@ -73,7 +72,6 @@ impl TreeScope {
         }
     }
 
-    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::SelfOnly => "self",
@@ -81,7 +79,6 @@ impl TreeScope {
         }
     }
 
-    #[must_use]
     pub fn from_token(token: &str) -> Option<Self> {
         match token {
             "self" => Some(Self::SelfOnly),
@@ -90,7 +87,6 @@ impl TreeScope {
         }
     }
 
-    #[must_use]
     pub fn rollup(self, node: &ProcessNode) -> super::model::MemoryRollup {
         match self {
             Self::SelfOnly => node.rollup(),
@@ -133,7 +129,6 @@ pub enum RowFold {
 }
 
 impl RowFold {
-    #[must_use]
     fn is_collapsed(self) -> bool {
         self == Self::Collapsed
     }
@@ -143,12 +138,10 @@ impl RowFold {
 pub struct RowIndex(usize);
 
 impl RowIndex {
-    #[must_use]
     fn new(index: usize) -> Self {
         Self(index)
     }
 
-    #[must_use]
     pub fn get(self) -> usize {
         self.0
     }
@@ -225,17 +218,14 @@ impl<Row: IdentifiedRow> Default for PaneRows<Row> {
 }
 
 impl<Row: IdentifiedRow> PaneRows<Row> {
-    #[must_use]
     pub fn rows(&self) -> &[Row] {
         &self.rows
     }
 
-    #[must_use]
     pub fn selected(&self) -> Option<&Row> {
         self.selected.and_then(|index| self.rows.get(index.get()))
     }
 
-    #[must_use]
     pub fn selected_index(&self) -> usize {
         self.selected.map_or(0, RowIndex::get)
     }
@@ -314,7 +304,6 @@ enum RowEdge {
 }
 
 impl RowEdge {
-    #[must_use]
     fn index(self, len: usize) -> Option<RowIndex> {
         match self {
             Self::First => (len > 0).then_some(RowIndex::new(0)),
@@ -333,14 +322,12 @@ impl Default for PageRows {
 }
 
 impl PageRows {
-    #[must_use]
     fn from_terminal_height(height: u16) -> Self {
         Self(usize::from(
             height.saturating_sub(TERMINAL_FRAME_ROWS).max(1),
         ))
     }
 
-    #[must_use]
     fn delta(self, direction: PageDirection) -> isize {
         let rows = self.0.min(isize::MAX as usize) as isize;
         match direction {
@@ -364,7 +351,6 @@ enum SelectionCustody {
 }
 
 impl SelectionCustody {
-    #[must_use]
     fn preserves_anchor(self) -> bool {
         self == Self::UserOwned
     }
@@ -380,14 +366,12 @@ struct DeMinimis {
 }
 
 impl DeMinimis {
-    #[must_use]
     fn from_largest_non_root(system_total: Bytes, largest_non_root: Bytes) -> Self {
         Self {
             threshold: pct(system_total, 1).min(pct(largest_non_root, 3)),
         }
     }
 
-    #[must_use]
     fn folds(self, value: Bytes) -> bool {
         self.threshold.0 > 0 && value < self.threshold
     }
@@ -508,14 +492,12 @@ impl ProjectionDebt {
         self.0 &= !(projection as u8);
     }
 
-    #[must_use]
     fn owes(&self, projection: Projection) -> bool {
         self.0 & projection as u8 != 0
     }
 }
 
 impl<Key: Ord> FoldPolicy<'_, Key> {
-    #[must_use]
     fn row_fold(&self, key: &Key, depth: usize, has_children: bool, total: Bytes) -> RowFold {
         if has_children {
             self.overrides.get(key).map_or_else(
@@ -593,7 +575,6 @@ pub struct KillConfirmation {
 }
 
 impl KillConfirmation {
-    #[must_use]
     fn new(target: ProcessKillTarget) -> Self {
         Self {
             target,
@@ -601,12 +582,10 @@ impl KillConfirmation {
         }
     }
 
-    #[must_use]
     pub fn armed(&self) -> bool {
         self.opened_at.elapsed() >= KILL_ARMING_DELAY
     }
 
-    #[must_use]
     pub fn lock_remaining(&self) -> Duration {
         KILL_ARMING_DELAY.saturating_sub(self.opened_at.elapsed())
     }
@@ -633,7 +612,6 @@ impl ProcessKillTarget {
         })
     }
 
-    #[must_use]
     pub fn cli(&self) -> &str {
         if self.command.is_empty() {
             &self.name
@@ -649,7 +627,6 @@ impl ProcessKillTarget {
 }
 
 impl App {
-    #[must_use]
     pub fn new(state: UiState) -> Self {
         Self {
             tab: state.tab,
@@ -679,7 +656,6 @@ impl App {
         }
     }
 
-    #[must_use]
     pub fn ui_state(&self) -> UiState {
         UiState {
             tab: self.tab,
@@ -697,7 +673,6 @@ impl App {
         self.sync_process_scanning(commands);
     }
 
-    #[must_use]
     pub fn is_focused(&self) -> bool {
         self.focused
     }
@@ -733,7 +708,6 @@ impl App {
         false
     }
 
-    #[must_use]
     pub fn refresh_pause(&self) -> Option<RefreshPause> {
         if !self.focused {
             Some(RefreshPause::Unfocused)
@@ -860,7 +834,6 @@ impl App {
         self.project_current_pane();
     }
 
-    #[must_use]
     pub fn needs_periodic_redraw(&self) -> bool {
         self.focused
             && (self.kill_confirmation().is_some()
@@ -892,7 +865,6 @@ impl App {
         }
     }
 
-    #[must_use]
     pub fn tab_labels() -> Vec<String> {
         Tab::ALL
             .iter()
@@ -901,7 +873,6 @@ impl App {
             .collect()
     }
 
-    #[must_use]
     pub fn current_time_label(&self) -> String {
         let Some(stamp) = self.active_stamp() else {
             return "loading".to_string();
@@ -930,7 +901,6 @@ impl App {
         }
     }
 
-    #[must_use]
     pub fn active_ledger_ready(&self) -> bool {
         match self.tab {
             Tab::Overview => self.ledgers.inventory.is_some(),
@@ -940,7 +910,6 @@ impl App {
         }
     }
 
-    #[must_use]
     pub fn meminfo(&self) -> Option<&Meminfo> {
         match self.tab {
             Tab::Overview | Tab::Tmpfs => self
@@ -961,33 +930,27 @@ impl App {
         }
     }
 
-    #[must_use]
     pub fn inventory(&self) -> Option<&Inventory> {
         self.ledgers.inventory.as_ref().map(|ledger| &ledger.value)
     }
 
-    #[must_use]
     pub fn processes(&self) -> Option<&Processes> {
         self.ledgers.process_data()
     }
 
-    #[must_use]
     pub fn tmpfs(&self) -> Option<&Tmpfs> {
         self.ledgers.tmpfs_data()
     }
 
-    #[must_use]
     pub fn shared(&self) -> Option<&Shared> {
         self.ledgers.shared_data()
     }
 
-    #[must_use]
     pub fn last_capture_elapsed(&self) -> Duration {
         self.active_stamp()
             .map_or(Duration::ZERO, |stamp| stamp.elapsed)
     }
 
-    #[must_use]
     pub fn process_capture_label(&self) -> String {
         self.ledgers.processes.as_ref().map_or_else(
             || "pending".to_string(),
@@ -995,7 +958,6 @@ impl App {
         )
     }
 
-    #[must_use]
     pub fn tmpfs_capture_label(&self) -> String {
         self.ledgers.tmpfs.as_ref().map_or_else(
             || "pending".to_string(),
@@ -1003,7 +965,6 @@ impl App {
         )
     }
 
-    #[must_use]
     pub fn warnings(&self) -> Vec<&str> {
         let mut warnings = Vec::new();
         match self.tab {
@@ -1034,7 +995,6 @@ impl App {
         warnings
     }
 
-    #[must_use]
     pub fn binding_sections(&self) -> BindingSections {
         BindingSections {
             global: nav::global_bindings(),
@@ -1098,12 +1058,10 @@ impl App {
         self.projection_debt.settle(Projection::Shared);
     }
 
-    #[must_use]
     pub fn search_pattern(&self) -> Option<&str> {
         self.search.as_ref().map(Search::pattern)
     }
 
-    #[must_use]
     pub fn search_draft(&self) -> Option<&SearchDraft> {
         match &self.modal {
             Some(Modal::Search(draft)) => Some(draft),
@@ -1111,12 +1069,10 @@ impl App {
         }
     }
 
-    #[must_use]
     pub fn help_open(&self) -> bool {
         matches!(self.modal, Some(Modal::Help { .. }))
     }
 
-    #[must_use]
     pub fn help_scroll(&self) -> u16 {
         match self.modal {
             Some(Modal::Help { scroll }) => scroll,
@@ -1124,7 +1080,6 @@ impl App {
         }
     }
 
-    #[must_use]
     pub fn kill_confirmation(&self) -> Option<&KillConfirmation> {
         match &self.modal {
             Some(Modal::Kill(confirmation)) => Some(confirmation),
@@ -1132,7 +1087,6 @@ impl App {
         }
     }
 
-    #[must_use]
     pub fn search_summary(&self) -> Option<&SearchSummary> {
         let _active = self.search.as_ref()?;
         Some(match self.tab {
@@ -1143,42 +1097,34 @@ impl App {
         })
     }
 
-    #[must_use]
     pub fn search_scope_label(&self) -> &'static str {
         self.tree_scope.label()
     }
 
-    #[must_use]
     pub fn process_rows(&self) -> &[FlatProcessRow] {
         self.process_rows.rows()
     }
 
-    #[must_use]
     pub fn tmpfs_rows(&self) -> &[FlatTmpfsRow] {
         self.tmpfs_rows.rows()
     }
 
-    #[must_use]
     pub fn shared_rows(&self) -> &[FlatSharedRow] {
         self.shared_rows.rows()
     }
 
-    #[must_use]
     pub fn selected_process_row(&self) -> usize {
         self.process_rows.selected_index()
     }
 
-    #[must_use]
     pub fn selected_tmpfs_row(&self) -> usize {
         self.tmpfs_rows.selected_index()
     }
 
-    #[must_use]
     pub fn selected_shared_row(&self) -> usize {
         self.shared_rows.selected_index()
     }
 
-    #[must_use]
     pub fn tmpfs_node(&self, row: &FlatTmpfsRow) -> Option<&TmpfsNode> {
         self.ledgers
             .tmpfs_data()?
@@ -1188,18 +1134,15 @@ impl App {
             .get(row.node_id.0)
     }
 
-    #[must_use]
     pub fn selected_tmpfs_node(&self) -> Option<&TmpfsNode> {
         self.tmpfs_node(self.tmpfs_rows.selected()?)
     }
 
-    #[must_use]
     pub fn selected_process(&self) -> Option<&ProcessNode> {
         let row = self.process_rows.selected()?;
         self.ledgers.process_data()?.tree.nodes.get(row.index)
     }
 
-    #[must_use]
     pub fn selected_process_objects(&self) -> &[ObjectUsage] {
         let Some(process) = self.selected_process() else {
             return &[];
@@ -1207,7 +1150,6 @@ impl App {
         self.process_mappings.objects(process.key())
     }
 
-    #[must_use]
     pub fn selected_process_mapping_status(&self) -> &'static str {
         let Some(process) = self.selected_process() else {
             return "none";
@@ -1216,7 +1158,6 @@ impl App {
             .state(process.key(), process.mappings_state)
     }
 
-    #[must_use]
     pub fn selected_process_mapping_loading(&self) -> Option<(Pid, Duration)> {
         let process = self.selected_process()?;
         self.process_mappings
@@ -1224,7 +1165,6 @@ impl App {
             .map(|elapsed| (process.pid, elapsed))
     }
 
-    #[must_use]
     pub fn selected_process_mapping_scan_label(&self) -> String {
         if let Some((pid, elapsed)) = self.selected_process_mapping_loading() {
             return format!("loading pid {pid}: {} ms", elapsed.as_millis());
@@ -1235,23 +1175,19 @@ impl App {
         self.process_mappings.scan_label(process.key())
     }
 
-    #[must_use]
     pub fn process_mapping_started_at(&self) -> Option<(Pid, Instant)> {
         self.process_mappings.first_loading()
     }
 
-    #[must_use]
     pub fn shared_scan_started_at(&self) -> Option<Instant> {
         self.shared_scan_started_at
     }
 
-    #[must_use]
     pub fn selected_tmpfs_mount(&self) -> Option<&TmpfsMount> {
         let row = self.tmpfs_rows.selected()?;
         self.ledgers.tmpfs_data()?.mounts.get(row.mount_index)
     }
 
-    #[must_use]
     pub fn selected_shared_object(&self) -> Option<&SharedObject> {
         let row = self.shared_rows.selected()?;
         self.ledgers.shared_data()?.objects.get(row.index)
@@ -1299,23 +1235,23 @@ impl App {
             Action::Kill => self.arm_process_kill(),
             Action::Refresh => self.refresh_current_pane(commands),
             Action::Move(delta) => {
-                let _ = self.move_selection_and_request_mappings(delta, commands);
+                self.move_selection_and_request_mappings(delta, commands);
             }
             Action::PageDown => {
-                let _ = self.page_selection_and_request_mappings(PageDirection::Down, commands);
+                self.page_selection_and_request_mappings(PageDirection::Down, commands);
             }
             Action::PageUp => {
-                let _ = self.page_selection_and_request_mappings(PageDirection::Up, commands);
+                self.page_selection_and_request_mappings(PageDirection::Up, commands);
             }
             Action::Fold(action) => {
                 let changed = self.mutate_current_fold(action);
-                let _ = self.request_selected_process_mappings_after(changed, commands);
+                self.request_selected_process_mappings_after(changed, commands);
             }
             Action::FirstRow => {
-                let _ = self.select_edge_and_request_mappings(RowEdge::First, commands);
+                self.select_edge_and_request_mappings(RowEdge::First, commands);
             }
             Action::LastRow => {
-                let _ = self.select_edge_and_request_mappings(RowEdge::Last, commands);
+                self.select_edge_and_request_mappings(RowEdge::Last, commands);
             }
         }
         false
@@ -1536,7 +1472,7 @@ impl App {
         if self.tmpfs_selection.preserves_anchor() {
             return;
         }
-        let _ = self.tmpfs_rows.select_edge(RowEdge::First);
+        self.tmpfs_rows.select_edge(RowEdge::First);
         self.tmpfs_selection.seize();
     }
 

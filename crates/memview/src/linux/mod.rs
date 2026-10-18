@@ -160,7 +160,6 @@ impl TerminationFlag {
         Ok(Self(pending))
     }
 
-    #[must_use]
     fn pending(&self) -> Option<i32> {
         i32::try_from(self.0.load(Ordering::SeqCst))
             .ok()
@@ -210,7 +209,7 @@ impl TerminalGuard {
     where
         F: FnOnce(&mut ratatui::Frame<'_>),
     {
-        let _ = self.terminal.draw(draw)?;
+        self.terminal.draw(draw)?;
         Ok(())
     }
 

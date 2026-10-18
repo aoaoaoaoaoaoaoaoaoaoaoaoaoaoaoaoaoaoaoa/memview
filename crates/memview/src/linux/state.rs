@@ -79,7 +79,6 @@ pub struct UiStateStore {
 }
 
 impl UiStateStore {
-    #[must_use]
     pub fn discover() -> Self {
         let Some(path) = state_path(
             env::var_os("XDG_STATE_HOME").map(PathBuf::from),
@@ -139,7 +138,6 @@ impl UiStateStore {
         }
     }
 
-    #[must_use]
     pub fn restored(&self) -> UiState {
         self.restored
     }

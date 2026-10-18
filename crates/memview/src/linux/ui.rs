@@ -1014,7 +1014,6 @@ enum MeminfoTone {
 }
 
 impl MeminfoTone {
-    #[must_use]
     fn for_key(key: &str) -> Self {
         match key {
             "MemAvailable" => Self::Reserve,
@@ -1025,7 +1024,6 @@ impl MeminfoTone {
         }
     }
 
-    #[must_use]
     fn color(self, value: Bytes, meminfo: &Meminfo) -> Color {
         match self {
             Self::Neutral => neutral_meminfo_color(value),
@@ -1374,17 +1372,17 @@ mod tests {
         let commands = WorkerPort::process_harness(requests);
         let mut app = App::new(UiState::default());
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
-        let _ = app.handle_key(
+        app.handle_key(
             KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
             &commands,
         );
-        let _ = terminal
+        terminal
             .draw(|frame| render(frame, &app))
             .expect("render help start");
         assert!(buffer_text(terminal.backend().buffer()).contains("Global"));
 
-        let _ = app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), &commands);
-        let _ = terminal
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), &commands);
+        terminal
             .draw(|frame| render(frame, &app))
             .expect("render help end");
         let text = buffer_text(terminal.backend().buffer());

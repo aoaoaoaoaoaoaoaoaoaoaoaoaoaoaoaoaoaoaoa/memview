@@ -185,7 +185,6 @@ pub struct Binding {
 }
 
 impl Binding {
-    #[must_use]
     pub fn resolve(&self, key: KeyEvent) -> Option<Action> {
         self.commands
             .iter()
@@ -545,12 +544,10 @@ const SHARED_ACTIONS: &[Binding] = &[
     ),
 ];
 
-#[must_use]
 pub fn global_bindings() -> &'static [Binding] {
     GLOBAL_BINDINGS
 }
 
-#[must_use]
 pub fn resolve(tab: Tab, key: KeyEvent) -> Option<Action> {
     bindings(tab).find_map(|binding| binding.resolve(key))
 }

@@ -33,17 +33,14 @@ impl Bytes {
     const KIB: f64 = 1024.0;
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
 
-    #[must_use]
     pub fn from_kib(kib: u64) -> Self {
         Self::from_wide(u128::from(kib) * 1024)
     }
 
-    #[must_use]
     pub fn from_blocks_512(blocks: u64) -> Self {
         Self::from_wide(u128::from(blocks) * 512)
     }
 
-    #[must_use]
     pub fn from_wide(bytes: u128) -> Self {
         match u64::try_from(bytes) {
             Ok(bytes) => Self(bytes),
@@ -51,12 +48,10 @@ impl Bytes {
         }
     }
 
-    #[must_use]
     pub fn as_f64(self) -> f64 {
         self.0 as f64
     }
 
-    #[must_use]
     pub fn pct_of(self, total: Self) -> f64 {
         if total.0 == 0 {
             0.0
@@ -65,7 +60,6 @@ impl Bytes {
         }
     }
 
-    #[must_use]
     pub fn human_iec(self) -> String {
         self.to_string()
     }
@@ -84,7 +78,6 @@ impl Bytes {
         write!(formatter, "{value:.1} {}", Self::UNITS[unit])
     }
 
-    #[must_use]
     pub fn human_exact(self) -> String {
         format!("{self} ({})", self.0)
     }
@@ -172,12 +165,10 @@ memory_rollup! {
 }
 
 impl MemoryRollup {
-    #[must_use]
     pub fn uss(self) -> Bytes {
         self.private_clean + self.private_dirty + self.private_hugetlb
     }
 
-    #[must_use]
     pub fn metric(self, metric: Metric) -> Bytes {
         match metric {
             Metric::Pss => self.pss,
@@ -203,7 +194,6 @@ pub struct Meminfo {
 }
 
 impl Meminfo {
-    #[must_use]
     pub fn value(&self, key: &str) -> Option<Bytes> {
         self.entries
             .iter()
@@ -211,7 +201,6 @@ impl Meminfo {
             .map(|entry| entry.value)
     }
 
-    #[must_use]
     pub fn physical_ledger(&self) -> Option<PhysicalMemoryLedger> {
         // /proc/meminfo is neither exhaustive nor wholly disjoint. This deliberately uses only
         // physical-state counters documented by the kernel and exposes the remainder as an
@@ -335,7 +324,6 @@ impl Display for BackingIdentity {
 }
 
 impl ObjectKind {
-    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::Anonymous => "anon",
@@ -391,7 +379,6 @@ pub enum LedgerState {
 }
 
 impl LedgerState {
-    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::Exact => "exact",
@@ -418,7 +405,6 @@ pub enum ProcessMemory {
 }
 
 impl ProcessMemory {
-    #[must_use]
     pub fn rollup(self) -> MemoryRollup {
         match self {
             Self::Smaps(rollup) => rollup,
@@ -431,7 +417,6 @@ impl ProcessMemory {
         }
     }
 
-    #[must_use]
     pub fn state(self) -> LedgerState {
         match self {
             Self::Smaps(_) => LedgerState::Exact,
@@ -469,7 +454,6 @@ pub struct ProcessRecord {
 }
 
 impl ProcessRecord {
-    #[must_use]
     pub fn key(&self) -> ProcessKey {
         ProcessKey {
             pid: self.pid,
@@ -477,12 +461,10 @@ impl ProcessRecord {
         }
     }
 
-    #[must_use]
     pub fn rollup(&self) -> MemoryRollup {
         self.memory.rollup()
     }
 
-    #[must_use]
     pub fn rollup_state(&self) -> LedgerState {
         self.memory.state()
     }
@@ -504,7 +486,6 @@ impl Deref for ProcessNode {
 }
 
 impl ProcessNode {
-    #[must_use]
     pub fn title(&self) -> String {
         if self.command.is_empty() {
             format!("{} [{}]", self.name, self.pid)
@@ -518,12 +499,10 @@ impl ProcessNode {
 pub struct ProcessCwd(String);
 
 impl ProcessCwd {
-    #[must_use]
     pub fn new(path: PathBuf) -> Self {
         Self(path.display().to_string())
     }
 
-    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -566,7 +545,6 @@ pub enum TmpfsNodeKind {
 }
 
 impl TmpfsNodeKind {
-    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::Mount => "mount",
@@ -611,12 +589,10 @@ pub struct TmpfsMount {
 }
 
 impl TmpfsMount {
-    #[must_use]
     pub fn node(&self, id: TmpfsNodeId) -> &TmpfsNode {
         &self.nodes[id.0]
     }
 
-    #[must_use]
     pub fn root(&self) -> &TmpfsNode {
         self.node(self.root)
     }
@@ -667,7 +643,6 @@ metric_catalog! {
 }
 
 impl Metric {
-    #[must_use]
     pub fn cmp_rollup(self, lhs: MemoryRollup, rhs: MemoryRollup) -> Ordering {
         rhs.metric(self).cmp(&lhs.metric(self))
     }

@@ -372,7 +372,7 @@ impl MountIndex {
                 continue;
             };
             if info.fs_type == "tmpfs" {
-                let _ = tmpfs_by_mountpoint
+                tmpfs_by_mountpoint
                     .entry(info.mount_point.clone())
                     .or_insert(info);
             }
@@ -1225,7 +1225,7 @@ fn build_process_tree(processes: Vec<ProcessRecord>, coverage: ProcessCoverage) 
     }
 
     for root in roots.clone() {
-        let _ = accumulate_subtree(root, &mut nodes);
+        accumulate_subtree(root, &mut nodes);
     }
 
     ProcessTree {
@@ -1336,7 +1336,7 @@ fn unique_tmpfs_infos(mount_index: &MountIndex) -> Vec<MountInfo> {
 fn scan_tmpfs_mount(info: &MountInfo, coverage: &mut TmpfsCoverage) -> Result<TmpfsMount> {
     let root_meta = fs::symlink_metadata(&info.mount_point)?;
     let mut seen_storage = BTreeSet::<(u64, u64)>::new();
-    let _ = seen_storage.insert((root_meta.dev(), root_meta.ino()));
+    seen_storage.insert((root_meta.dev(), root_meta.ino()));
     let mut nodes = vec![TmpfsBuilder {
         storage: TmpfsStorageId {
             device: root_meta.dev(),

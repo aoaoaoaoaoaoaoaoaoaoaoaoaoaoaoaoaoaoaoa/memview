@@ -253,7 +253,7 @@ fn process_scanning_tracks_focus_activity_and_active_tab() {
 #[test]
 fn fold_policy_respects_roots_leaves_and_manual_overrides() {
     let mut overrides = BTreeMap::new();
-    let _ = overrides.insert(7, FoldOverride::Expanded);
+    overrides.insert(7, FoldOverride::Expanded);
     let policy = FoldPolicy {
         overrides: &overrides,
         de_minimis: DeMinimis {
@@ -293,7 +293,7 @@ fn vim_fold_grammar_composes_subtree_and_forest_depth_operations() {
 
     let press = |app: &mut App, keys: &str| {
         for key in keys.chars() {
-            let _ = app.handle_key(
+            app.handle_key(
                 KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
                 &commands,
             );
@@ -418,7 +418,7 @@ fn first_tmpfs_entry_seizes_top_then_preserves_user_anchor() {
         tmpfs_mount("/tmpfs-small", Bytes(1)),
     ]));
     app.rebuild_tmpfs_rows();
-    let _ = app.tmpfs_rows.move_by(1);
+    app.tmpfs_rows.move_by(1);
 
     app.select_tab(Tab::Tmpfs, &commands);
     assert_eq!(app.selected_tmpfs_row(), 0);
@@ -540,13 +540,13 @@ fn page_keys_move_one_visible_pane() {
             .collect(),
     );
 
-    let _ = app.handle_key(
+    app.handle_key(
         KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
         &commands,
     );
     assert_eq!(app.selected_tmpfs_row(), 3);
 
-    let _ = app.handle_key(
+    app.handle_key(
         KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
         &commands,
     );

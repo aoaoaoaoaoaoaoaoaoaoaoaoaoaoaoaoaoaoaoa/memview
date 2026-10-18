@@ -172,7 +172,7 @@ fn build_forest_rows<F: Forest>(
                     push_direct_matches(forest, root, 0, search, &mut rows, &mut summary);
                 }
                 TreeScope::SelfAndChildren => {
-                    let _ = push_contextual_matches(
+                    push_contextual_matches(
                         forest,
                         root,
                         0,
