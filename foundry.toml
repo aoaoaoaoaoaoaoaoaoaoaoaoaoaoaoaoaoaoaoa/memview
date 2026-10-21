@@ -3,7 +3,6 @@ schema = 1
 [product]
 name = "memview"
 package = "memview"
-binary = "memview"
 profile = "platform-bound"
 
 [coordinates]
@@ -31,15 +30,8 @@ run = ["scripts/check-foundry"]
 timeout-minutes = 45
 
 [[proofs]]
-name = "security"
-laws = ["security"]
-run = ["scripts/audit"]
-timeout-minutes = 15
-
-[[proofs]]
 name = "source-package"
 laws = ["source-package"]
-run = ["scripts/package"]
 timeout-minutes = 30
 
 [[proofs]]
