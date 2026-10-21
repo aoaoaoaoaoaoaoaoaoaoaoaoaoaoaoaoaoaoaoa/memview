@@ -1,3 +1,4 @@
+mod activity;
 mod app;
 mod model;
 mod nav;
@@ -6,6 +7,7 @@ mod search;
 mod state;
 mod ui;
 
+use activity::Activity;
 use app::{App, spawn_worker};
 use clap::Parser;
 use color_eyre::eyre::{Result, ensure};
@@ -18,6 +20,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use libshimmer::TICK;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use state::UiStateStore;
@@ -28,7 +31,8 @@ use std::time::{Duration, Instant};
 
 const FOCUSED_IDLE_POLL: Duration = Duration::from_millis(500);
 const BACKGROUND_IDLE_POLL: Duration = Duration::from_secs(1);
-const ANIMATED_REDRAW: Duration = Duration::from_millis(250);
+/// Animated content, such as the activity shimmer, redraws every shimmer tick.
+const ANIMATED_REDRAW: Duration = TICK;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "ncdu-like RAM accounting for Linux /proc")]
@@ -58,6 +62,7 @@ pub fn run() -> MainResult {
     }
     app.set_terminal_height(terminal.height()?);
     app.start_visible_work(&commands);
+    let mut activity = Activity::summon(Instant::now())?;
     let mut dirty = true;
     let mut next_animated_redraw = Instant::now();
 
@@ -74,7 +79,7 @@ pub fn run() -> MainResult {
         let now = Instant::now();
         let redraw_animation = app.needs_periodic_redraw() && now >= next_animated_redraw;
         if app.is_focused() && (dirty || redraw_animation) {
-            terminal.draw(|frame| ui::render(frame, &app))?;
+            draw(&mut terminal, &app, &mut activity)?;
             dirty = false;
             next_animated_redraw = Instant::now() + ANIMATED_REDRAW;
         }
@@ -124,7 +129,7 @@ pub fn run() -> MainResult {
                     app.set_focused(false, &commands);
                     // The terminal may remain visible after losing focus. Paint
                     // the pause reason once, then leave its contents untouched.
-                    terminal.draw(|frame| ui::render(frame, &app))?;
+                    draw(&mut terminal, &app, &mut activity)?;
                     dirty = false;
                 }
                 Event::Paste(_) => {}
@@ -165,6 +170,12 @@ impl TerminationFlag {
             .ok()
             .filter(|signal| *signal != 0)
     }
+}
+
+/// Advances the activity shimmer to now and draws a frame.
+fn draw(terminal: &mut TerminalGuard, app: &App, activity: &mut Activity) -> Result<()> {
+    activity.follow(app, Instant::now());
+    terminal.draw(|frame| ui::render(frame, app, activity))
 }
 
 fn poll_timeout(app: &App, next_animated_redraw: Instant) -> Duration {

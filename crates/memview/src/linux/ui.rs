@@ -1,3 +1,4 @@
+use super::activity::Activity;
 use super::app::{App, Binding, FlatProcessRow, FlatSharedRow, FlatTmpfsRow, RowFold};
 use super::model::{
     Bytes, Meminfo, MeminfoEntry, NvidiaPoolLedger, ObjectUsage, PhysicalResidual, Pid,
@@ -5,6 +6,7 @@ use super::model::{
 };
 use super::nav::FooterHint;
 use super::search::SearchRole;
+use libshimmer::{Motion, Palette};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -13,15 +15,17 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap}
 use std::borrow::Cow;
 use std::time::Duration;
 
-const BG: Color = Color::Rgb(12, 17, 24);
-const FG: Color = Color::Rgb(221, 227, 234);
+const BG_RGB: (u8, u8, u8) = (12, 17, 24);
+const FG_RGB: (u8, u8, u8) = (221, 227, 234);
+const BG: Color = Color::Rgb(BG_RGB.0, BG_RGB.1, BG_RGB.2);
+const FG: Color = Color::Rgb(FG_RGB.0, FG_RGB.1, FG_RGB.2);
 const MUTED: Color = Color::Rgb(129, 145, 160);
 const ACCENT: Color = Color::Rgb(64, 184, 173);
 const HOT: Color = Color::Rgb(227, 116, 94);
 const GOLD: Color = Color::Rgb(236, 180, 71);
 const FOOTER_KEY: Color = Color::Rgb(211, 218, 226);
 
-pub fn render(frame: &mut Frame<'_>, app: &App) {
+pub fn render(frame: &mut Frame<'_>, app: &App, activity: &Activity) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -33,6 +37,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         .split(area);
 
     frame.render_widget(header(app), chunks[0]);
+    render_activity(frame, app, activity, chunks[0]);
     if app.active_ledger_ready() {
         render_body(frame, app, chunks[1]);
     } else {
@@ -61,6 +66,12 @@ fn render_body(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn header(app: &App) -> Paragraph<'static> {
+    Paragraph::new(header_line(app))
+        .block(panel("Memory Ledger"))
+        .style(Style::default().fg(FG).bg(BG))
+}
+
+fn header_line(app: &App) -> Line<'static> {
     let mut spans = Vec::new();
     spans.push(Span::styled(
         " memview ",
@@ -90,10 +101,52 @@ fn header(app: &App) -> Paragraph<'static> {
             Style::default().fg(ACCENT),
         ));
     }
+    Line::from(spans)
+}
 
-    Paragraph::new(Line::from(spans))
-        .block(panel("Memory Ledger"))
-        .style(Style::default().fg(FG).bg(BG))
+/// memview's own colors, against which the activity shimmer blends.
+fn palette() -> Palette {
+    Palette {
+        fg: FG_RGB.into(),
+        bg: BG_RGB.into(),
+    }
+}
+
+/// The activity readout, right-aligned in the header bar: the scan under way, dressed by the
+/// shimmer, then its elapsed time. Absent while no scan runs, and when the bar lacks room.
+fn render_activity(frame: &mut Frame<'_>, app: &App, activity: &Activity, area: Rect) {
+    let Some(running) = activity.running(app) else {
+        return;
+    };
+    let row = activity.shimmer().status(
+        palette(),
+        Motion {
+            mark: true,
+            letters: true,
+        },
+    );
+    let mut spans = row.spans();
+    spans.push(Span::styled(
+        format!("  {} ms", running.as_millis()),
+        Style::default().fg(MUTED),
+    ));
+    let line = Line::from(spans);
+    let bar = Block::default().borders(Borders::ALL).inner(area);
+    let width = u16::try_from(line.width()).unwrap_or(u16::MAX);
+    let taken = u16::try_from(header_line(app).width()).unwrap_or(u16::MAX);
+    if taken.saturating_add(2).saturating_add(width) > bar.width {
+        return;
+    }
+    let lead = Rect {
+        x: bar.right() - width,
+        width,
+        ..bar
+    };
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().fg(FG).bg(BG)),
+        lead,
+    );
+    row.shade(lead, frame.buffer_mut());
 }
 
 fn footer(app: &App) -> Paragraph<'_> {
@@ -152,26 +205,6 @@ fn footer(app: &App) -> Paragraph<'_> {
                 Style::default().fg(GOLD),
             ));
         }
-    }
-    if app.tab.drives_process_scans()
-        && let Some(started) = app.process_scan_started_at
-    {
-        spans.push(Span::styled(
-            format!("  process scan {} ms", started.elapsed().as_millis()),
-            Style::default().fg(MUTED),
-        ));
-    }
-    if let Some((pid, started)) = app.process_mapping_started_at() {
-        spans.push(Span::styled(
-            format!("  mappings {pid} {} ms", started.elapsed().as_millis()),
-            Style::default().fg(MUTED),
-        ));
-    }
-    if let Some(started) = app.shared_scan_started_at() {
-        spans.push(Span::styled(
-            format!("  shared ledger {} ms", started.elapsed().as_millis()),
-            Style::default().fg(MUTED),
-        ));
     }
     Paragraph::new(Line::from(spans))
         .wrap(Wrap { trim: false })
@@ -1372,18 +1405,19 @@ mod tests {
         let commands = WorkerPort::process_harness(requests);
         let mut app = App::new(UiState::default());
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        let activity = Activity::summon(std::time::Instant::now()).expect("activity shimmer");
         app.handle_key(
             KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
             &commands,
         );
         terminal
-            .draw(|frame| render(frame, &app))
+            .draw(|frame| render(frame, &app, &activity))
             .expect("render help start");
         assert!(buffer_text(terminal.backend().buffer()).contains("Global"));
 
         app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), &commands);
         terminal
-            .draw(|frame| render(frame, &app))
+            .draw(|frame| render(frame, &app, &activity))
             .expect("render help end");
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("anonymous regions"));
