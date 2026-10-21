@@ -495,6 +495,8 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 [[package]]
 name = "libshimmer"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fbef4f10aaebe4ecad70be5c9bf5a4a0bdb766d5632fc982dfe8787d131d9aa"
 dependencies = [
  "ratatui-core",
  "unicode-segmentation",
