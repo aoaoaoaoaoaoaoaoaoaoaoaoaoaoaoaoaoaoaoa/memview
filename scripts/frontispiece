@@ -44,16 +44,19 @@ builtin_box_drawing = false
 background = "#0c1118"  # memview's own ground, under the frame's last 2 px rows
 """
 # The pane keeps the site's grid whatever Alacritty measures; RGB passes through, as
-# does the device-attributes query that marks how far Alacritty has read.
+# does the device-attributes query that marks how far Alacritty has read, even from a
+# window no client shows.
 TMUX = f"""\
 set -g status off
-set -g allow-passthrough on
+set -g allow-passthrough all
 set -g default-terminal tmux-256color
 set -as terminal-features ',*:RGB'
 set -g escape-time 0
 set -g window-size manual
 set -g default-size {GRID}
 """
+# The Tmpfs pane once the tmpfs lens has captured.
+TMPFS = re.compile(r"tmpfs generation \(\d+/\d+ filesystems")
 # The Overview with every lens captured: processes and tmpfs stamped, an interval below.
 CAPTURED = (
     re.compile(r"independent attribution captures"),
@@ -61,10 +64,12 @@ CAPTURED = (
     re.compile(r"Σ tmpfs allocated \[#\d+\]"),
     re.compile(r"capture #\d+ \d+\.\.\d+ \(\d+ ms\)"),
 )
-# Primary device attributes, wrapped for tmux to forward to Alacritty.
-MARK = b"\x1bPtmux;\x1b\x1b[c\x1b\\"
+# A printf format for primary device attributes, wrapped for tmux to forward to
+# Alacritty. It is printed from a window of its own, so it can never land inside one of
+# memview's escape sequences.
+MARK = r"\033Ptmux;\033\033[c\033\\"
 # Alacritty's event trace: it answered the mark, drew, then handled a later event.
-PRESENTED = re.compile(r"PtyWrite\(.*c\)\).*\n(?:.*\n)*?.*RedrawRequested.*\n.*\n")
+PRESENTED = re.compile(rb"PtyWrite\(.*c\)\).*\n(?:.*\n)*?.*RedrawRequested.*\n.*\n")
 
 
 def memview() -> Path:
@@ -139,11 +144,11 @@ def environment(cell: Path) -> dict[str, str]:
     } | {name: str(root) for name, root in roots.items()}
 
 
-def awaited(probe: Callable[[], str], ready: Callable[[str], bool], what: str) -> None:
+def awaited[T](probe: Callable[[], T], ready: Callable[[T], bool], what: str) -> None:
     deadline = time.monotonic() + 120
     while not ready(seen := probe()):
         if time.monotonic() > deadline:
-            raise SystemExit(f"never saw {what}; last saw:\n{seen}")
+            raise SystemExit(f"never saw {what}; last saw:\n{seen!s}")
         time.sleep(0.02)
 
 
@@ -200,7 +205,13 @@ def develop(binary: Path, still: Path) -> None:
             f"Alacritty measure the {GRID} grid",
         )
         # Pass through the Tmpfs pane: only it requests the tmpfs lens.
-        tmux("send-keys", "3", "1")
+        tmux("send-keys", "3")
+        awaited(
+            lambda: tmux("capture-pane", "-p"),
+            lambda screen: TMPFS.search(screen) is not None,
+            "the Tmpfs pane captured",
+        )
+        tmux("send-keys", "1")
         awaited(
             lambda: tmux("capture-pane", "-p"),
             lambda screen: all(fact.search(screen) for fact in CAPTURED),
@@ -209,9 +220,9 @@ def develop(binary: Path, still: Path) -> None:
         # The pane only grows more complete from here: once Alacritty has read through
         # the mark and drawn, the frame it presents is a captured Overview.
         marked = trace.stat().st_size
-        Path(tmux("display-message", "-p", "#{pane_tty}").strip()).write_bytes(MARK)
+        tmux("new-window", "-d", "printf", MARK)
         awaited(
-            lambda: trace.read_text()[marked:],
+            lambda: trace.read_bytes()[marked:],
             lambda events: PRESENTED.search(events) is not None,
             "Alacritty draw past the mark",
         )
