@@ -1,0 +1,233 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.14"
+# dependencies = []
+# ///
+"""Develop memview's frontispiece: its Overview of the live /proc on a private display.
+
+Builds this checkout's memview and runs it in a tmux pane that Alacritty draws on a
+private 1440x920 Xvfb display, with private XDG roots, so the operator's desktop and UI
+state are never touched. It passes through the Tmpfs pane so the tmpfs lens captures,
+returns to the Overview, waits until the pane shows every lens captured, and writes
+DIR/frontispiece.png. Prints its path. The Overview shows aggregates only.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from collections.abc import Callable
+from contextlib import ExitStack
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+FRAME = ("1440", "920")
+# 8x17 px cells: the site's 180x54 grid, with the frame's last 2 px rows as padding.
+GRID = "180x54"
+ALACRITTY = """\
+[window]
+decorations = "None"
+padding = { x = 0, y = 0 }
+dynamic_padding = false
+
+[font]
+normal = { family = "JetBrains Mono", style = "Light" }
+size = 10.5
+offset = { x = 0, y = -3 }
+builtin_box_drawing = false
+
+[colors.primary]
+background = "#0c1118"  # memview's own ground, under the frame's last 2 px rows
+"""
+# The pane keeps the site's grid whatever Alacritty measures; RGB passes through, as
+# does the device-attributes query that marks how far Alacritty has read.
+TMUX = f"""\
+set -g status off
+set -g allow-passthrough on
+set -g default-terminal tmux-256color
+set -as terminal-features ',*:RGB'
+set -g escape-time 0
+set -g window-size manual
+set -g default-size {GRID}
+"""
+# The Overview with every lens captured: processes and tmpfs stamped, an interval below.
+CAPTURED = (
+    re.compile(r"independent attribution captures"),
+    re.compile(r"Σ process PSS \[#\d+\]"),
+    re.compile(r"Σ tmpfs allocated \[#\d+\]"),
+    re.compile(r"capture #\d+ \d+\.\.\d+ \(\d+ ms\)"),
+)
+# Primary device attributes, wrapped for tmux to forward to Alacritty.
+MARK = b"\x1bPtmux;\x1b\x1b[c\x1b\\"
+# Alacritty's event trace: it answered the mark, drew, then handled a later event.
+PRESENTED = re.compile(r"PtyWrite\(.*c\)\).*\n(?:.*\n)*?.*RedrawRequested.*\n.*\n")
+
+
+def memview() -> Path:
+    subprocess.run(
+        ["cargo", "build", "--locked", "--release", "--package", "memview"],
+        cwd=ROOT,
+        check=True,
+        stdout=sys.stderr,
+    )
+    metadata = subprocess.run(
+        ["cargo", "metadata", "--locked", "--format-version", "1", "--no-deps"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    return Path(json.loads(metadata)["target_directory"]) / "release/memview"
+
+
+def display(stack: ExitStack, env: dict[str, str]) -> str:
+    """Start a private X server and return its name once it accepts clients."""
+    announcement, announcer = os.pipe()
+    server = subprocess.Popen(
+        [
+            "Xvfb",
+            "-displayfd",
+            str(announcer),
+            "-screen",
+            "0",
+            "x".join(FRAME) + "x24",
+            "-dpi",
+            "96",
+            "-nolisten",
+            "tcp",
+            "-noreset",
+        ],
+        pass_fds=(announcer,),
+        env=env,
+        stderr=subprocess.DEVNULL,
+    )
+    os.close(announcer)
+    stack.callback(server.wait)
+    stack.callback(server.terminate)
+    with os.fdopen(announcement) as pipe:
+        number = pipe.readline().strip()
+    if not number:
+        raise SystemExit("Xvfb never announced a display")
+    return f":{number}"
+
+
+def environment(cell: Path) -> dict[str, str]:
+    roots = {
+        name: cell / name.lower()
+        for name in (
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_RUNTIME_DIR",
+        )
+    }
+    for root in roots.values():
+        root.mkdir(mode=0o700)
+    return {
+        "PATH": os.environ["PATH"],
+        "HOME": str(cell),
+        "LANG": "C.UTF-8",
+        # Mesa's software rasterizer, for Xvfb's own GLX as for Alacritty: the host GPU
+        # driver serves neither.
+        "LIBGL_ALWAYS_SOFTWARE": "1",
+        "__EGL_VENDOR_LIBRARY_FILENAMES": "/usr/share/glvnd/egl_vendor.d/50_mesa.json",
+    } | {name: str(root) for name, root in roots.items()}
+
+
+def awaited(probe: Callable[[], str], ready: Callable[[str], bool], what: str) -> None:
+    deadline = time.monotonic() + 120
+    while not ready(seen := probe()):
+        if time.monotonic() > deadline:
+            raise SystemExit(f"never saw {what}; last saw:\n{seen}")
+        time.sleep(0.02)
+
+
+def develop(binary: Path, still: Path) -> None:
+    with (
+        tempfile.TemporaryDirectory(prefix="memview-frontispiece-") as name,
+        ExitStack() as stack,
+    ):
+        cell = Path(name)
+        env = environment(cell)
+        env["DISPLAY"] = display(stack, env)
+        (cell / "alacritty.toml").write_text(ALACRITTY)
+        (cell / "tmux.conf").write_text(TMUX)
+        server = ["tmux", "-u", "-S", str(cell / "tmux")]
+
+        def tmux(*args: str) -> str:
+            return subprocess.run(
+                [*server, *args], env=env, check=True, capture_output=True, text=True
+            ).stdout
+
+        tmux("-f", str(cell / "tmux.conf"), "new-session", "-d", str(binary))
+        stack.callback(subprocess.run, [*server, "kill-server"], env=env, check=False)
+        trace = cell / "alacritty.events"
+        config = cell / "alacritty.toml"
+        terminal = subprocess.Popen(
+            [
+                "alacritty",
+                "--print-events",
+                "--config-file",
+                str(config),
+                "-e",
+                *server,
+                "attach",
+            ],
+            env=env,
+            stdout=stack.enter_context(trace.open("w")),
+            stderr=subprocess.DEVNULL,
+        )
+        stack.callback(terminal.wait)
+        stack.callback(terminal.kill)
+        window = subprocess.run(
+            ["xdotool", "search", "--sync", "--pid", str(terminal.pid)],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        ).stdout.split()[0]
+        place = ["windowmove", window, "0", "0", "windowsize", "--sync", window, *FRAME]
+        subprocess.run(["xdotool", *place], env=env, check=True)
+        awaited(
+            lambda: tmux("list-clients", "-F", "#{client_width}x#{client_height}"),
+            lambda clients: clients.strip() == GRID,
+            f"Alacritty measure the {GRID} grid",
+        )
+        # Pass through the Tmpfs pane: only it requests the tmpfs lens.
+        tmux("send-keys", "3", "1")
+        awaited(
+            lambda: tmux("capture-pane", "-p"),
+            lambda screen: all(fact.search(screen) for fact in CAPTURED),
+            "the Overview with every lens captured",
+        )
+        # The pane only grows more complete from here: once Alacritty has read through
+        # the mark and drawn, the frame it presents is a captured Overview.
+        marked = trace.stat().st_size
+        Path(tmux("display-message", "-p", "#{pane_tty}").strip()).write_bytes(MARK)
+        awaited(
+            lambda: trace.read_text()[marked:],
+            lambda events: PRESENTED.search(events) is not None,
+            "Alacritty draw past the mark",
+        )
+        subprocess.run(["import", "-window", "root", str(still)], env=env, check=True)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("dir", type=Path, help="directory receiving frontispiece.png")
+    args = parser.parse_args()
+    binary = memview()
+    args.dir.mkdir(parents=True, exist_ok=True)
+    still = args.dir / "frontispiece.png"
+    develop(binary, still)
+    print(still)
+
+
+if __name__ == "__main__":
+    main()
